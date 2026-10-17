@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drama 3 for ComfyUI</title>
+<meta name="description" content="Fish Audio Drama 3 text to speech, natively in ComfyUI: voice cloning, dialogue and inline cues on cards from 8 GB.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --accent: #FFA931; --accent-ink: #1F2328; --accent-strong: #C76A00;
+  --bg: #FFFFFF; --bg-soft: #F6F8FA; --card: #FFFFFF; --ink: #1F2328; --muted: #59636E; --line: #D1D9E0;
+  --wave: #E8891C; --wave-played: #1F2328; --blue: #3C7BC0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0D1117; --bg-soft: #151B23; --card: #151B23; --ink: #F0F6FC; --muted: #9198A1; --line: #3D444D;
+    --wave: #FFA931; --wave-played: #F0F6FC; --blue: #64B5F6; --accent-strong: #FFA931;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0D1117; --bg-soft: #151B23; --card: #151B23; --ink: #F0F6FC; --muted: #9198A1; --line: #3D444D;
+  --wave: #FFA931; --wave-played: #F0F6FC; --blue: #64B5F6; --accent-strong: #FFA931;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 'IBM Plex Sans', 'Segoe UI', Helvetica, Arial, sans-serif; }
+code, .mono { font-family: 'IBM Plex Mono', SFMono-Regular, Consolas, monospace; font-size: 0.92em; }
+a { color: var(--accent-strong); }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+nav { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--line); }
+nav .wrap { display: flex; align-items: center; gap: 22px; height: 58px; }
+nav .brand { font-weight: 700; color: var(--ink); text-decoration: none; margin-right: auto; }
+nav .brand span { color: var(--accent-strong); }
+nav a.link { color: var(--muted); text-decoration: none; font-size: 15px; }
+nav a.link:hover { color: var(--ink); }
+.button { display: inline-flex; align-items: center; gap: 8px; height: 40px; padding: 0 18px; border-radius: 8px; font-weight: 600;
+          font-size: 15px; text-decoration: none; border: 1px solid var(--line); color: var(--ink); background: var(--card); cursor: pointer; }
+.button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+header.hero { padding: 72px 0 40px; }
+.news { display: inline-flex; align-items: center; gap: 10px; margin-bottom: 22px; padding: 6px 14px 6px 6px; border-radius: 999px;
+        border: 1px solid var(--line); background: var(--bg-soft); color: var(--ink); text-decoration: none; font-size: 15px; }
+.news b { background: var(--accent); color: var(--accent-ink); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+.news:hover { border-color: var(--accent); }
+.hero h1 { font-size: clamp(34px, 5vw, 54px); line-height: 1.08; margin: 0 0 18px; letter-spacing: -1px; max-width: 820px; }
+.hero h1 em { font-style: normal; color: var(--accent-strong); }
+.hero p.lead { font-size: 19px; color: var(--muted); max-width: 720px; margin: 0 0 28px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 44px; }
+.fact { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; background: var(--bg-soft); }
+.fact b { display: block; font-size: 26px; letter-spacing: -0.5px; }
+.fact span { color: var(--muted); font-size: 14px; }
+section { padding: 56px 0; border-top: 1px solid var(--line); }
+section h2 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.5px; }
+section p.sub { color: var(--muted); margin: 0 0 28px; max-width: 760px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+.tile { border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; background: var(--card); display: flex; flex-direction: column; gap: 12px; }
+.tile.playing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+h3.group { font-size: 20px; margin: 36px 0 14px; }
+h3.group:first-child { margin-top: 0; }
+.source { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); background: var(--bg-soft); border-radius: 10px; padding: 6px 10px; }
+.source button { flex: none; width: 28px; height: 28px; border-radius: 14px; border: 1px solid var(--line); background: var(--card); color: var(--ink);
+                 cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.source button svg { width: 11px; height: 11px; }
+.tile header { display: flex; align-items: center; gap: 12px; }
+.tile h3 { margin: 0; font-size: 18px; }
+.tile .voice { color: var(--muted); font-size: 14px; }
+.play { flex: none; width: 42px; height: 42px; border-radius: 21px; border: 0; background: var(--accent); color: var(--accent-ink);
+        cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.play svg { width: 16px; height: 16px; }
+canvas.wave { width: 100%; height: 56px; cursor: pointer; display: block; }
+.time { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.text { font-family: 'IBM Plex Mono', Consolas, monospace; font-size: 13.5px; line-height: 1.6; white-space: pre-wrap;
+        background: var(--bg-soft); border-radius: 10px; padding: 10px 12px; margin: 0; }
+.tag { color: var(--accent-strong); }
+.tile footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.copy { font-size: 13px; height: 30px; padding: 0 12px; }
+.settings { font-size: 13px; color: var(--muted); }
+.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; counter-reset: step; }
+.step { border: 1px solid var(--line); border-radius: 14px; padding: 18px; background: var(--card); }
+.step::before { counter-increment: step; content: counter(step); display: inline-flex; width: 28px; height: 28px; border-radius: 14px;
+                background: var(--accent); color: var(--accent-ink); font-weight: 700; align-items: center; justify-content: center; margin-bottom: 10px; }
+.step h3 { margin: 0 0 6px; font-size: 18px; }
+.step p { margin: 0 0 10px; color: var(--muted); font-size: 15px; }
+pre.cmd { background: var(--bg-soft); border-radius: 10px; padding: 10px 12px; margin: 0; overflow-x: auto; font-size: 13px; }
+.flow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 22px; }
+.node { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; font-size: 14px; background: var(--card); }
+.node.accent { border-color: var(--accent); }
+.arrow { color: var(--muted); }
+.tablewrap { overflow-x: auto; }
+table { width: 100%; min-width: 640px; border-collapse: collapse; font-size: 15px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 14px; }
+.pick { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); margin-left: 6px; }
+.bars { display: grid; gap: 10px; margin-top: 8px; }
+.barrow { display: grid; grid-template-columns: 250px 1fr 120px; gap: 12px; align-items: center; font-size: 14px; }
+.barrow .track { position: relative; height: 22px; background: var(--bg-soft); border-radius: 6px; }
+.barrow .before { position: absolute; inset: 0 auto 0 0; background: var(--line); border-radius: 6px; }
+.barrow .fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 6px; }
+.barrow .was { color: var(--muted); font-weight: 400; }
+.legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 14px; color: var(--muted); margin-top: 14px; }
+.legend i { display: inline-block; width: 14px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: 0; }
+.barrow .rt { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--ink); }
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-top: 26px; }
+.note { border-left: 3px solid var(--accent); padding: 2px 0 2px 14px; }
+.note b { display: block; margin-bottom: 4px; }
+.note span { color: var(--muted); font-size: 15px; }
+details { border-bottom: 1px solid var(--line); padding: 14px 0; }
+summary { cursor: pointer; font-weight: 600; font-size: 17px; }
+details p { color: var(--muted); margin: 10px 0 0; }
+footer.site { padding: 36px 0 60px; color: var(--muted); font-size: 14px; border-top: 1px solid var(--line); }
+footer.site a { color: var(--muted); }
+@media (max-width: 720px) {
+  nav a.link { display: none; }
+  .barrow { grid-template-columns: 1fr 60px; }
+  .barrow .label { grid-column: 1 / -1; }
+}
+</style>
+</head>
+<body>
+<nav><div class="wrap">
+  <a class="brand" href="#">ComfyUI-<span>Drama3</span></a>
+  <a class="link" href="#samples">Samples</a>
+  <a class="link" href="#start">Get started</a>
+  <a class="link" href="#files">Files</a>
+  <a class="link" href="#performance">Performance</a>
+  <a class="link" href="#faq">FAQ</a>
+  <a class="button" href="https://github.com/PedroMarinhoDev/ComfyUI-Drama3">GitHub</a>
+</div></nav>
+
+<div class="wrap">
+<header class="hero">
+  <a class="news" href="#performance"><b>New</b>3× faster decoding since October 17: an 8 GB card keeps up with real time →</a>
+  <h1>Fish Audio Drama 3, <em>natively in ComfyUI</em>, on cards from 8 GB.</h1>
+  <p class="lead">Expressive text to speech with voice cloning, up to 16 speakers in one text and cues like <code>[sighs]</code> or
+  <code>[whispers]</code>. The 32 GB of routed experts stay in system RAM and the GPU keeps a cache of the ones in use, so a
+  35B model runs on a consumer card, and since October 17 one 24 GB card speaks 2–4× faster than real time. A native
+  Qwen3-ASR writes your voice clip's transcript.</p>
+  <div class="cta">
+    <a class="button primary" href="#start">Get started</a>
+    <a class="button" href="#samples">Listen to samples</a>
+    <a class="button" href="https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI">Weights on Hugging Face</a>
+    <a class="button" href="https://github.com/PedroMarinhoDev/ComfyUI-Drama3">Custom nodes repo</a>
+  </div>
+  <div class="facts">
+    <div class="fact"><b>35B</b><span>parameters, 3B per frame</span></div>
+    <div class="fact"><b>8 of 256</b><span>experts per layer, per frame</span></div>
+    <div class="fact"><b>8 GB</b><span>of VRAM is enough with experts in RAM</span></div>
+    <div class="fact"><b>20 ms</b><span>per frame on an RTX 4090 (int8); 46 is real time</span></div>
+  </div>
+</header>
+</div>
+
+<section id="samples"><div class="wrap">
+  <h2>Samples</h2>
+  <p class="sub">No real person is cloned here. The first four clone two voices the model made up from a single line; the rest are
+  prompts with no voice at all, where the model invents one. Drama 3 FP8, experts in RAM, temperature 1.0, top_p 0.9, top_k 30.
+  Copy a text to try it yourself.</p>
+  <div id="sample-groups"></div>
+  <h3 class="group">The two voices</h3>
+  <p class="sub">Each made from one line with no reference; the cloned samples above use them like any other clip.</p>
+  <div class="grid" id="voice-grid"></div>
+</div></section>
+
+<section id="start"><div class="wrap">
+  <h2>Get started</h2>
+  <p class="sub">Three steps to the first take. You need ComfyUI v0.40 or newer, an NVIDIA GPU with 8 GB or more, and system
+  RAM for the model file plus about 8 GB.</p>
+  <div class="steps">
+    <div class="step"><h3>Install the nodes</h3><p>Clone into <code>custom_nodes</code> and restart ComfyUI. Nothing to pip install.</p>
+      <pre class="cmd">cd ComfyUI/custom_nodes
+git clone https://github.com/PedroMarinhoDev/ComfyUI-Drama3</pre></div>
+    <div class="step"><h3>Download three files</h3><p>From Hugging Face:</p>
+      <pre class="cmd">drama3_fp8experts_bf16.safetensors
+  → models/diffusion_models  38.6 GB
+drama3_codec.safetensors
+  → models/vae                1.6 GB
+qwen3_asr_1.7b_bf16.safetensors
+  → models/asr                4.1 GB</pre></div>
+    <div class="step"><h3>Open the workflow and queue</h3><p>Drag <code>drama3_voice_clone.json</code> into ComfyUI, pick a few seconds of
+      clean speech, write your text, run.</p>
+      <pre class="cmd">example_workflows/drama3_voice_clone.json</pre></div>
+  </div>
+  <div class="flow">
+    <span class="node">Load Audio</span><span class="arrow">→</span>
+    <span class="node">Qwen3-ASR Transcribe</span><span class="arrow">→</span>
+    <span class="node accent">Drama 3 Encode Voice</span><span class="arrow">→</span>
+    <span class="node accent">Drama 3 Generate</span><span class="arrow">→</span>
+    <span class="node accent">Drama 3 Decode</span><span class="arrow">→</span>
+    <span class="node">Save Audio</span>
+  </div>
+</div></section>
+
+<section id="files"><div class="wrap">
+  <h2>Files</h2>
+  <p class="sub">Start with FP8: Fish Audio's own expert weights, byte for byte. The format, not the GPU, sets the system RAM you
+  need; take a smaller file when your RAM is short of the FP8 file's ~48 GB.</p>
+  <div class="tablewrap"><table>
+    <tr><th>File</th><th>Size</th><th>Experts</th><th>System RAM</th><th>Use it for</th></tr>
+    <tr><td><code>drama3_fp8experts_bf16</code><span class="pick">start here</span></td><td>38.6 GB</td><td>FP8, as Fish Audio ships them</td><td>~48 GB</td><td>the original weights</td></tr>
+    <tr><td><code>drama3_int8experts_bf16</code></td><td>38.7 GB</td><td>int8 ConvRot</td><td>~48 GB</td><td>cards under 24 GB: as close to the original as FP8 and twice as fast there; no silent take in 12 cloned test takes</td></tr>
+    <tr><td><code>drama3_w6a8experts_bf16</code></td><td>32.7 GB</td><td>W6A8</td><td>~40 GB</td><td>less RAM; no silent take in 16 cloned test takes</td></tr>
+    <tr><td><code>drama3_w4a8experts_bf16</code></td><td>24.6 GB</td><td>W4A8</td><td>~32 GB</td><td>the least RAM; falls silent more often with real voice clips</td></tr>
+    <tr><td><code>drama3_codec.safetensors</code></td><td>1.6 GB</td><td>–</td><td>–</td><td>the original codec, needed with every file</td></tr>
+    <tr><td><code>qwen3_asr_1.7b_bf16</code> / <code>0.6b</code></td><td>4.1 / 1.6 GB</td><td>–</td><td>–</td><td>transcripts; the 0.6B takes half the time</td></tr>
+  </table></div>
+</div></section>
+
+<section id="performance"><div class="wrap">
+  <h2>Performance</h2>
+  <p class="sub">Milliseconds per audio frame as ComfyUI runs the nodes, experts in RAM unless noted, a cloned voice, ~9 s of
+  speech, the mean of two seeds; measured on 2026-10-17 with an Intel Core i9-14900K, against the pack of 2026-10-16 measured the
+  same way. Drama 3 makes 21.5 frames per second of speech: the line marks real time, 46 ms. The held bars ran with the rest of the
+  3090's memory taken, as on a 12 GB or 8 GB card.</p>
+  <div class="bars" id="bars"></div>
+  <div class="legend"><span><i style="background: var(--accent)"></i>now</span><span><i style="background: var(--line)"></i>before 2026-10-17, in brackets</span><span><i style="background: var(--ink); width: 2px"></i>real time, 46 ms</span></div>
+  <div class="notes">
+    <div class="note"><b>Nothing waits on the CPU</b><span>The pack's CUDA kernels look experts up in the VRAM cache on the GPU and
+      read the missed ones straight from RAM, so every layer replays as a CUDA graph. PyTorch compiles them at run time:
+      no compiler or package to install.</span></div>
+    <div class="note"><b>The CPU lends a hand</b><span>With int8 experts the CPU computes part of the experts the cache misses
+      while the GPU runs the rest, which matters most on small cards: twice as fast as FP8 with a 4 GB cache.</span></div>
+    <div class="note"><b>Transcripts are quick</b><span>Qwen3-ASR transcribes a 6.6 s clip in ~2 s (1.7B) or ~1 s (0.6B) on an RTX 3090.</span></div>
+  </div>
+</div></section>
+
+<section id="faq"><div class="wrap">
+  <h2>FAQ</h2>
+  <details><summary>Which file should I download?</summary><p>FP8 if you have about 48 GB of free system RAM: it's the original
+    weights. On a card under 24 GB take int8 instead: the same size, measured as close to the original, and twice as fast there
+    because the CPU computes part of its experts. W6A8 needs ~40 GB, W4A8 ~32 GB, and both run fastest on a 24 GB card; W4A8 falls
+    silent more often with real voice clips.</p></details>
+  <details><summary>Can I clone any voice?</summary><p>Only voices you have the right to use. The Fish Audio Community License forbids
+    imitating an identifiable person without their consent.</p></details>
+  <details><summary>Why does a take sometimes go silent?</summary><p>Usually the voice: the transcript must cover every word of the
+    clip, and the clip should be clean speech cut between sentences. Some clips make the model fall silent in Fish Audio's own code
+    too (a known issue); try another seed or another stretch of the recording.</p></details>
+  <details><summary>Speech comes out slow or flat</summary><p>Keep temperature at 1.0 and top_p at 0.9: lower values add pauses and
+    flatten the voice. The model copies the reference's delivery, so pick a lively clip for a lively take.</p></details>
+  <details><summary>Which tags can I use?</summary><p>Any: directions are free natural language, not a fixed list. Point tags
+    such as <code>[sighs]</code> or <code>[pause]</code> land where you put them, <code>&lt;whisper&gt;...&lt;/whisper&gt;</code> shapes
+    the words inside, a <code>[style]</code> at the start sets the whole line, and <code>&lt;|speaker:N|&gt;</code> (0 to 15) switches
+    speakers. Fish Audio's full syntax is Appendix C of the
+    <a href="https://github.com/fishaudio/fish-speech/blob/main/docs/assets/Fish_Audio_Drama_3_Technical_Report.pdf">Drama 3 technical
+    report</a>; the <a href="https://github.com/PedroMarinhoDev/ComfyUI-Drama3#tags-and-directions">README</a> has a table.</p></details>
+  <details><summary>Can I keep a voice without encoding the clip again?</summary><p>Yes. <b>Save Drama 3 Voice</b> writes the
+    encoded voice, codes and transcript, to a <code>.safetensors</code> of a few KB in <code>output/drama3_voices</code>;
+    <b>Load Drama 3 Voice</b> brings it back with no clip to load and nothing to encode or transcribe again. The example
+    workflow has the save node, muted.</p></details>
+  <details><summary>Do I need a voice at all?</summary><p>No. Without one the model invents a voice, a different one for each seed;
+    the two voices on this page were made that way.</p></details>
+  <details><summary>Can I use it commercially?</summary><p>Drama 3's weights and outputs fall under the Fish Audio Community License:
+    free for research and non-commercial use, and for commercial use below USD 500k annual revenue; a hosted TTS service needs a
+    license from Fish Audio. Read the license for the details.</p></details>
+</div></section>
+
+<footer class="site"><div class="wrap">
+  <p><b>Built with Fish Audio.</b> Code GPL-3.0; Drama 3, its codec, tokenizer and the code ported from Fish Audio's under the Fish
+  Audio Community License; Qwen3-ASR under the Apache License 2.0. Not affiliated with or endorsed by Fish Audio or Qwen.</p>
+  <p><a href="https://github.com/PedroMarinhoDev/ComfyUI-Drama3">GitHub</a> ·
+     <a href="https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI">Hugging Face</a> ·
+     <a href="https://huggingface.co/fishaudio/drama-3">Fish Audio Drama 3</a> ·
+     <a href="https://github.com/QwenLM/Qwen3-ASR">Qwen3-ASR</a></p>
+</div></footer>
+
+<script>
+const BARS = [
+  ["RTX 4090 · W4A8 · 16 GB cache", 56.9, 11.7], ["RTX 4090 · int8 · 16 GB cache", 67.0, 20.2],
+  ["RTX 3090 · int8 · 16 GB cache", 68.8, 23.2], ["RTX 3090 · FP8 · 16 GB cache", 67.6, 24.8],
+  ["RTX 3090 · int8 · 4 GB cache", 104.2, 34.4], ["RTX 3090 · FP8 · 4 GB cache", 107.5, 58.0],
+  ["RTX 3090 held to 12 GB · int8", 110.1, 37.5], ["RTX 3090 held to 8 GB · int8", 145.2, 45.8],
+  ["RTX 3090 held to 8 GB · FP8", 148.6, 97.3], ["RTX 3090 + 4090 · in VRAM · int8", 56.7, 13.2],
+];
+const PLAY = '<svg viewBox="0 0 16 16"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg>';
+const PAUSE = '<svg viewBox="0 0 16 16"><path d="M4 2.5h3v11H4zM9 2.5h3v11H9z" fill="currentColor"/></svg>';
+let current = null;
+
+function escapeHtml(s) { return s.replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
+function markTags(s) { return escapeHtml(s).replace(/(\[[^\]]+\]|&lt;\|speaker:\d+\|&gt;)/g, '<span class="tag">$1</span>'); }
+function clock(t) { return `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`; }
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function tile(item, grid) {
+  const el = document.createElement("article");
+  el.className = "tile";
+  el.innerHTML = `<header><button class="play" aria-label="Play ${escapeHtml(item.title)}">${PLAY}</button>
+    <div><h3>${escapeHtml(item.title)}</h3><div class="voice">${escapeHtml(item.voice)}</div></div></header>
+    ${item.source ? `<div class="source"><button aria-label="Play the source voice">${PLAY}</button><span>Source voice, the clip it clones</span></div>` : ""}
+    <canvas class="wave"></canvas><div class="time">0:00</div>
+    <pre class="text">${markTags(item.text)}</pre>
+    <footer><span class="settings">${escapeHtml(item.settings || "1.0 · 0.9 · 30")}</span><button class="button copy">Copy text</button></footer>`;
+  grid.appendChild(el);
+  const audio = new Audio(item.file);
+  audio.preload = "metadata";
+  const canvas = el.querySelector("canvas"), button = el.querySelector(".play"), time = el.querySelector(".time");
+  if (item.source) {
+    const source = new Audio(item.source), sourceButton = el.querySelector(".source button");
+    sourceButton.addEventListener("click", () => {
+      if (!source.paused) { source.pause(); return; }
+      if (current && current !== source) current.pause();
+      current = source;
+      source.play();
+    });
+    source.addEventListener("play", () => { sourceButton.innerHTML = PAUSE; });
+    source.addEventListener("pause", () => { sourceButton.innerHTML = PLAY; });
+  }
+  let peaks = null;
+  const draw = () => {
+    const ratio = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * ratio; canvas.height = h * ratio;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(ratio, ratio);
+    if (!peaks) return;
+    const bars = Math.floor(w / 4), played = audio.duration ? audio.currentTime / audio.duration : 0;
+    for (let i = 0; i < bars; i++) {
+      const p = peaks[Math.floor(i / bars * peaks.length)], bh = Math.max(2, p * h);
+      ctx.fillStyle = i / bars < played ? css("--wave-played") : css("--wave");
+      ctx.fillRect(i * 4, (h - bh) / 2, 2.5, bh);
+    }
+  };
+  fetch(item.file).then(r => r.arrayBuffer()).then(b => new (window.AudioContext || window.webkitAudioContext)().decodeAudioData(b))
+    .then(buffer => {
+      const data = buffer.getChannelData(0), n = 400, size = Math.floor(data.length / n);
+      peaks = new Float32Array(n);
+      let max = 1e-6;
+      for (let i = 0; i < n; i++) {
+        let m = 0;
+        for (let j = i * size; j < (i + 1) * size; j++) m = Math.max(m, Math.abs(data[j]));
+        peaks[i] = m; max = Math.max(max, m);
+      }
+      peaks = peaks.map(v => v / max);
+      time.textContent = `0:00 / ${clock(buffer.duration)}`;
+      draw();
+    }).catch(() => { time.textContent = "audio unavailable"; });
+  button.addEventListener("click", () => {
+    if (!audio.paused) { audio.pause(); return; }
+    if (current && current !== audio) current.pause();
+    current = audio;
+    audio.play();
+  });
+  audio.addEventListener("play", () => { button.innerHTML = PAUSE; el.classList.add("playing"); });
+  audio.addEventListener("pause", () => { button.innerHTML = PLAY; el.classList.remove("playing"); });
+  audio.addEventListener("ended", () => { audio.currentTime = 0; draw(); });
+  audio.addEventListener("timeupdate", () => { time.textContent = `${clock(audio.currentTime)} / ${clock(audio.duration || 0)}`; draw(); });
+  canvas.addEventListener("click", e => {
+    if (!audio.duration) return;
+    audio.currentTime = e.offsetX / canvas.clientWidth * audio.duration;
+    draw();
+  });
+  el.querySelector(".copy").addEventListener("click", e => {
+    navigator.clipboard.writeText(item.text).then(() => { e.target.textContent = "Copied"; setTimeout(() => e.target.textContent = "Copy text", 1500); });
+  });
+  window.addEventListener("resize", draw);
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+}
+
+fetch("samples.json").then(r => r.json()).then(data => {
+  const groups = document.getElementById("sample-groups");
+  for (const name of [...new Set(data.samples.map(item => item.group))]) {
+    const heading = document.createElement("h3");
+    heading.className = "group";
+    heading.textContent = name;
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    groups.append(heading, grid);
+    data.samples.filter(item => item.group === name).forEach(item => tile(item, grid));
+  }
+  data.voices.forEach(voice => tile({...voice, voice: "made with no reference", text: data.voice_line}, document.getElementById("voice-grid")));
+});
+const max = Math.max(...BARS.map(b => b[1] ?? b[2])) * 1.1;
+document.getElementById("bars").innerHTML = BARS.map(([label, before, ms]) => `<div class="barrow"><span class="label">${label}</span>
+  <div class="track">${before ? `<div class="before" style="width:${before / max * 100}%"></div>` : ""}<div class="fill" style="width:${ms / max * 100}%"></div><div class="rt" style="left:${46 / max * 100}%"></div></div>
+  <b>${ms} ms${before ? ` <span class="was">(${before})</span>` : ""}</b></div>`).join("");
+</script>
+</body>
+</html>

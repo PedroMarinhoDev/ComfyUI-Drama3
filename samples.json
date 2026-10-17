@@ -1,0 +1,144 @@
+{
+ "voice_line": "Hi there! I'm one of the voices this model can make up on its own, and I'm ready to read anything you write.",
+ "voices": [
+  {
+   "id": "voice_a",
+   "title": "Voice A",
+   "file": "samples/voice_a.mp3"
+  },
+  {
+   "id": "voice_b",
+   "title": "Voice B",
+   "file": "samples/voice_b.mp3"
+  }
+ ],
+ "samples": [
+  {
+   "id": "cloning",
+   "title": "Voice cloning",
+   "group": "Cloned voices",
+   "voice": "clones Voice A",
+   "text": "The lighthouse keeper climbed the last step, set her lantern on the sill, and watched the storm roll in across the bay. Somewhere below, a bell began to ring.",
+   "file": "samples/cloning.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30",
+   "source": "samples/cloning_source.mp3"
+  },
+  {
+   "id": "cues",
+   "title": "Inline cues",
+   "group": "Cloned voices",
+   "voice": "clones Voice B",
+   "text": "[whispers] Don't move. I think it heard us. [pause] [sighs] Oh, it's only the cat. [laughs] You should have seen your face.",
+   "file": "samples/cues.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "dialogue",
+   "title": "Two speakers",
+   "group": "Cloned voices",
+   "voice": "clones Voices A and B",
+   "text": "<|speaker:0|> Did you remember the tickets?\n<|speaker:1|> [laughs] I thought you had them!\n<|speaker:0|> [sighs] Then we're watching the concert from the parking lot.",
+   "file": "samples/dialogue.mp3",
+   "settings": "seed 2 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "emotion",
+   "title": "Emotion",
+   "group": "Cloned voices",
+   "voice": "clones Voice B",
+   "text": "[excited] We did it! It actually works! [shouting] Everybody, come and look at this, right now!",
+   "file": "samples/emotion.mp3",
+   "settings": "seed 3 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "dnd",
+   "title": "Five speakers",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "<|speaker:0|> [dramatic dungeon master] You enter the dark cave. A dragon sleeps on a pile of gold.\n<|speaker:1|> [brave, too loud] I attack the dragon!\n<|speaker:0|> [pause] It's asleep. Are you sure?\n<|speaker:2|> [panicking] Don't attack the dragon!\n<|speaker:3|> [chill, slow] I'm gonna try to seduce the dragon.\n<|speaker:4|> [nerdy, excited] Actually, by the rules, the dragon gets a perception check.\n<|speaker:1|> [rolls dice] Natural one.\n<|speaker:0|> [sighs] You trip over the gold. The dragon wakes up.\n<|speaker:3|> [unbothered] Hey there, big guy.\n<|speaker:2|> [screaming] WE'RE ALL GONNA DIE!",
+   "file": "samples/dnd.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "toast",
+   "title": "Singing",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[singing, grand operatic] Oh toast, my golden toast, you're the bread I love the most! [singing softly] Crispy edges, warm and brown, finest slice in all the town. [spoken, alarmed] Wait, is it burning? [sniffs] It's burning. [singing dramatically, falling apart] Oh toast, my blackened toast, now you're just a crunchy ghost! [sobbing] Why must all good things char?",
+   "file": "samples/toast.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "futebol",
+   "title": "Portuguese",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[Brazilian football fan, building tension, Portuguese] Vai, vai, vai, vai! Ele passou por um, passou por dois, [shouting] olha o chute! [pause] [screaming with total joy] GOOOOOOOOL! GOL! GOL DO BRASIL! [laughing hysterically] Eu não acredito! Que golaço! [crying with emotion] Pai, você viu isso? Você viu? [hugging, breathless] Trinta anos esperando por esse momento, trinta anos!",
+   "file": "samples/futebol.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "auctioneer",
+   "title": "Auctioneer",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[fast-talking auctioneer, rapid fire] Alright folks, lot number forty-seven, one slightly haunted rocking chair, do I hear ten, ten dollar, ten dollar, now fifteen, fifteen, fifteen in the back, now twenty, twenty-dollar-bid-now-twenty-five, will-ya-give-me-twenty-five, twenty-five to the lady with the ghost, [pause] wait, ma'am, is that the ghost bidding? [nervous laugh] Ha. Okay. Thirty from the ghost. Going once, going twice, [gasps] the chair is rocking by itself. SOLD! [whispering] Please take it away immediately.",
+   "file": "samples/auctioneer.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "pirate",
+   "title": "Pirate GPS",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[gruff pirate captain, very loud] Arrr! In two hundred meters, turn starboard onto Maple Street! [pause] Ye missed it, ye landlubber! [sighs] Recalculating. [grumbling] Recalculating me whole life, I am. [cheerful again] Arrr! Proceed for three nautical miles, then keep the parking lot on yer port side. [suspicious] Why be we stopping at a drive-through? [delighted] Ooh, get the fish sandwich. [whispering] For the crew.",
+   "file": "samples/pirate.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "laughing",
+   "title": "Laughing fit",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[trying to tell a story, already giggling] Okay, okay, so we're at the restaurant, and the waiter comes over, and Mark, Mark goes— [laughs] no, wait, wait, I can do this. [deep breath] Mark tries to order in French, right, and instead of \"the duck\", he says— [bursts out laughing] he says— [wheezing] I can't, I can't breathe— [laughing uncontrollably] he asked the waiter to KISS HIM— [gasping] and the waiter said \"maybe later\"! [crying from laughing] Oh my God, my stomach hurts.",
+   "file": "samples/laughing.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "hold",
+   "title": "On hold",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[soothing automated voice] Your call is important to us. Please stay on the line. [pause] Your call is important to us. Please stay on the line. [pause] Your call is very important to us. [slightly strained] Please. Stay. On the line. [pause] Your call is… [voice breaking] honestly, your call is the only thing that gives my life meaning. [sobbing] Please don't hang up. [pause] [suddenly calm and robotic] Your call is important to us.",
+   "file": "samples/hold.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "sneeze",
+   "title": "Sneeze",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[distinguished professor, giving a lecture] And so, in conclusion, the fundamental theorem demonstrates that— [inhales sharply] ah… [pause] ah… [pause] AH… [pause] [relieved] nope, it's gone. As I was saying, the theorem demonstrates— [inhales] ah… AH… [sneezes] ACHOO! [sneezes] ACHOO! [sneezes] ACHOO! [sniffs] [dignified] …that the integral converges. Class dismissed.",
+   "file": "samples/sneeze.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "horror",
+   "title": "Bedtime story",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[gentle bedtime storyteller] Once upon a time, in a cozy little village, there lived a fluffy bunny named Biscuit. Biscuit loved carrots, and sunshine, and his best friend the moon. [pause] One night, Biscuit looked up at the moon, and the moon <whisper>looked back.</whisper> [pause] [slowly] It blinked. [whispering] It smiled with too many teeth. <slow>And it said: Biscuit… come outside.</slow> [suddenly cheerful] The end! Goodnight, sweetie!",
+   "file": "samples/horror.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  },
+  {
+   "id": "lullaby",
+   "title": "4 a.m. lullaby",
+   "group": "Voices the model invents",
+   "voice": "no reference, seed 1",
+   "text": "[exhausted new parent, whispering] Shh, shh, shh. It's okay. It's okay, little bean. [sighs] It's four in the morning. Daddy has a meeting in five hours. [humming softly] Mm-hm-hmm. [whispering] You're so loud for something so small. [pause] [yawning] Okay. Okay, look, I'll make you a deal. You sleep, and I'll— [pause] [quietly, amazed] Oh. You're asleep. [barely audible] Don't move. Nobody move. [softly] I love you, you little goblin.",
+   "file": "samples/lullaby.mp3",
+   "settings": "seed 1 · 1.0 · 0.9 · 30"
+  }
+ ]
+}
