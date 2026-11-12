@@ -1,7 +1,4 @@
-<a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/"><picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.png">
-  <img alt="Write the script. It plays the part. Fish Audio Drama 3 in ComfyUI: a script with its directions in amber, playing." src="assets/hero-light.png" width="100%">
-</picture></a>
+<p><a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.png"><img alt="Write the script. It plays the part. Fish Audio Drama 3 in ComfyUI: a script with its directions in amber, playing." src="assets/hero-light.png" width="100%"></picture></a></p>
 
 **ComfyUI-Drama3** runs [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3), a 35B text-to-speech model,
 natively in ComfyUI. Clone a voice from a few seconds of audio, cast up to 16 speakers in one script and write
@@ -19,10 +16,7 @@ Fish Audio retrained Drama 3's weights on 2026-10-29. With them, 108 of 120 test
 69. The small files are now tuned on the model's own speech, decoding is faster on every card, long scripts render twice as fast with
 lines at once, and `voice_guidance` keeps two voices apart in a dialogue whose lines hear each other.
 
-<a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/#update"><picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/update-dark.png">
-  <img alt="Before and after: complete takes 69 to 108 of 120, silent takes 48 to 1, FP8 on 24 GB 2.0x to 2.7x real time, W4A8 on 8 GB 0.6x to 1.0x, a ten-minute two-voice story 225 s to 111 s." src="assets/update-light.png" width="100%">
-</picture></a>
+<p><a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/#update"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/update-dark.png"><img alt="Before and after: complete takes 69 to 108 of 120, silent takes 48 to 1, FP8 on 24 GB 2.0x to 2.7x real time, W4A8 on 8 GB 0.6x to 1.0x, a ten-minute two-voice story 225 s to 111 s." src="assets/update-light.png" width="100%"></picture></a></p>
 
 > [!IMPORTANT]
 > **Updating?** Update the nodes first, then download a model file again. Older nodes refuse the new files with
@@ -32,10 +26,7 @@ lines at once, and `voice_guidance` keeps two voices apart in a dialogue whose l
 
 ## Listen
 
-<a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/#listen"><picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/takes-dark.png">
-  <img alt="Takes rendered with this release, cloned voices first, each shown as its script with the directions in amber. Click to listen on the demo page." src="assets/takes-light.png" width="100%">
-</picture></a>
+<p><a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/#listen"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/takes-dark.png"><img alt="Takes rendered with this release, cloned voices first, each shown as its script with the directions in amber. Click to listen on the demo page." src="assets/takes-light.png" width="100%"></picture></a></p>
 
 The cloned voices come from two public-domain films of 1948 and 1954 with uncredited narrators, and from open speech
 corpora recorded for research by anonymous volunteers (CSTR VCTK and Google FLEURS, CC BY 4.0). The demo page credits
