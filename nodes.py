@@ -3,6 +3,7 @@ them to audio; and Qwen3-ASR to transcribe a reference.
 
 The codec runs before and after generation only, so it is never resident next to the model while frames are sampled.
 """
+import copy
 import hashlib
 import json
 import logging
@@ -18,16 +19,17 @@ import comfy.audio
 import comfy.model_management
 import comfy.utils
 import folder_paths
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import ComfyExtension, io, ui
+from comfy_extras.nodes_audio import load as load_audio_file
 from server import PromptServer
 
-from .drama3.audio import tidy_clip, trim_pauses
+from .drama3.audio import cut_at_pause, tidy_clip, trim_edges, trim_pauses
 from .drama3.chunking import CHUNK_BYTES, CHUNK_MAX_SPEAKERS, by_speaker, chunk_lines, split_text
 from .drama3.editor import DEFAULTS, analyze, parse_edits, plan, render
 from .drama3.codec import DECODE_CONTEXT, DECODE_FRAME_BYTES, DECODE_WINDOW, FRAME_LENGTH, SAMPLE_RATE
-from .drama3.generate import generate
+from .drama3.generate import batchable, generate, generate_lines, session_rows
 from .drama3.loader import load_codec, load_drama3
-from .drama3.prompt import LINE_SEPARATOR, MAX_SPEAKER, as_speaker_0, build_prompt, speaker_of, with_speaker_tag
+from .drama3.prompt import LINE_SEPARATOR, MAX_SPEAKER, as_speaker_0, build_prompt, retag, speaker_of, with_speaker_tag
 from .qwen3_asr.asr import LANGUAGES, load_qwen3_asr, transcribe
 
 Drama3Model = io.Custom("DRAMA3_MODEL")
@@ -37,11 +39,17 @@ Drama3Codes = io.Custom("DRAMA3_CODES")
 Qwen3ASRModel = io.Custom("QWEN3_ASR_MODEL")
 # the vendor's limit on prompt rows (references, history and text)
 MAX_PROMPT_ROWS = 8192
+# max_frames 0: a chunk's cap from its text. Speech takes about 1.6 frames per byte (2.1 at most over a 48-line story);
+# acted lines full of pauses took up to 3 (871 frames for 293 bytes) and 4.1 on a 37-byte chunk
+AUTO_FRAMES = 150
+AUTO_FRAMES_PER_BYTE = 4
 # seconds of silence Decode puts between separately generated takes, the Editor's shortest gap between lines
 TAKE_GAP = 0.3
 # Fish Audio's Drama 3 Space shortens longer pauses to this many seconds
 MAX_PAUSE = 0.75
 SPEAKER_MODES = ["one take per line", "one take per line, hearing the line before", "one take per speaker", "together"]
+# the modes in which a take hears another voice, which voice guidance steers it away from
+GUIDED_MODES = ("one take per line, hearing the line before", "together")
 
 
 VOICES_FOLDER = os.path.join(folder_paths.get_output_directory(), "drama3_voices")
@@ -112,6 +120,59 @@ class Drama3CodecLoader(io.ComfyNode):
     @classmethod
     def execute(cls, codec_name) -> io.NodeOutput:
         return io.NodeOutput(load_codec(folder_paths.get_full_path_or_raise("vae", codec_name)))
+
+
+# Longest reference clips: Fish Audio recommends 10-30 s of reference audio, and their Drama 3 Space cuts at 20 s.
+REFERENCE_LENGTHS = {"5 s": 5.0, "10 s": 10.0, "15 s": 15.0, "20 s": 20.0, "30 s": 30.0}
+
+
+class Drama3LoadReferenceAudio(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        input_dir = folder_paths.get_input_directory()
+        os.makedirs(input_dir, exist_ok=True)
+        files = folder_paths.filter_files_content_types(os.listdir(input_dir), ["audio", "video"])
+        return io.Schema(
+            node_id="Drama3LoadReferenceAudio",
+            display_name="Load Reference Audio",
+            category="audio/drama3",
+            search_aliases=["voice clip", "reference voice", "trim audio"],
+            description="Load Audio for a voice to clone: the clip without its silent edges, cut where it pauses so it is no "
+                        "longer than `length`, as Fish Audio's Drama 3 Space prepares a reference. The player plays the "
+                        "file, then the trimmed clip once the node has run.",
+            inputs=[
+                io.Combo.Input("audio", upload=io.UploadType.audio, options=sorted(files)),
+                io.Boolean.Input("trim", default=True, tooltip="Cut the silence at the clip's edges and keep at most `length`. "
+                                 "Off: the file as it is, like Load Audio."),
+                io.Combo.Input("length", options=list(REFERENCE_LENGTHS), default="20 s",
+                               tooltip="The longest the clip may be. A longer clip is cut in its latest pause before this "
+                                       "length, so it stops between words and its transcript stays exact. Fish Audio recommends "
+                                       "10-30 s of reference audio and their Drama 3 Space cuts at 20 s; clean, fluent "
+                                       "speech matters more than length, and a shorter clip makes a shorter prompt."),
+            ],
+            outputs=[io.Audio.Output()],
+        )
+
+    @classmethod
+    def execute(cls, audio, trim, length) -> io.NodeOutput:
+        waveform, sample_rate = load_audio_file(folder_paths.get_annotated_filepath(audio))
+        if trim:
+            waveform = cut_at_pause(trim_edges(waveform), sample_rate, REFERENCE_LENGTHS[length])
+        clip = {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
+        return io.NodeOutput(clip, ui=ui.PreviewAudio(clip, cls=cls))
+
+    @classmethod
+    def fingerprint_inputs(cls, audio, trim, length):
+        m = hashlib.sha256()
+        with open(folder_paths.get_annotated_filepath(audio), "rb") as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def validate_inputs(cls, audio):
+        if not folder_paths.exists_annotated_filepath(audio):
+            return f"Invalid audio file: {audio}"
+        return True
 
 
 class Drama3EncodeVoice(io.ComfyNode):
@@ -211,9 +272,10 @@ class Drama3Generate(io.ComfyNode):
                 io.Int.Input("top_k", default=0, min=0, max=4096,
                              tooltip="0 keeps every candidate, as Fish Audio's Drama 3 Space does: at a pause a few silence codes "
                                      "outrank the many ways speech resumes, and top_k 30 left 11 of their 40 takes silent."),
-                io.Int.Input("max_frames", default=600, min=1, max=8192,
+                io.Int.Input("max_frames", default=0, min=0, max=8192,
                              tooltip="At most this many frames per text chunk (21.5 per second of audio); generation ends earlier "
-                                     "at end of speech."),
+                                     "at end of speech. 0 sizes the cap from each chunk's text: 150 frames plus 4 per byte, over "
+                                     "twice what speech usually takes."),
                 io.Boolean.Input("split_long_text", default=True,
                                  tooltip="Generate long text in chunks of about 300 bytes, each continuing from the first and the "
                                          "latest chunk, as Fish Audio's own server does."),
@@ -225,13 +287,22 @@ class Drama3Generate(io.ComfyNode):
                                        "in. one take per speaker: all of a speaker's lines in one take, cut at the line breaks it "
                                        "says and put back in script order. together: the dialogue as one script, every line "
                                        "hearing the others. Decode and the Editor decode each take on its own."),
+                io.Float.Input("voice_guidance", default=0.0, min=0.0, max=3.0, step=0.25,
+                               tooltip="For dialogue generated together or hearing the line before, with a voice for each speaker: "
+                                       "each take is steered away from the same text said in the other speaker's voice, so the "
+                                       "voices stay apart. 1.0 is a good value. On a two-voice dialogue (6 seeds) the second "
+                                       "voice's lines went from nearly as close to the other speaker's clip as to their own to "
+                                       "clearly their own (lead +0.02 to +0.08 hearing the line before, +0.01 to +0.05 together; "
+                                       "none of 18 lines nearer the other voice, against 3 and 9); 2.0 gained little more and "
+                                       "cost words in two takes. Cost: those takes render about twice as long, and a seed's "
+                                       "takes change. Needs one GPU and ComfyUI after v0.41.2."),
             ],
             outputs=[Drama3Codes.Output()],
         )
 
     @classmethod
     def execute(cls, model, text, voices, seed, temperature, top_p, top_k, max_frames, split_long_text=True,
-                speakers="one take per line") -> io.NodeOutput:
+                speakers="one take per line", voice_guidance=0.0) -> io.NodeOutput:
         # an untagged transcript speaks for its slot: voice1 is <|speaker:1|>
         references = [(with_speaker_tag(voice["transcript"], int(name.removeprefix("voice"))), voice["codes"])
                       for name, voice in voices.items() if voice is not None]
@@ -247,50 +318,131 @@ class Drama3Generate(io.ComfyNode):
         # 18 without it): when every speaker has a voice, the references alone keep them apart
         speakers_in_text = {speaker_of(line) for chunk in chunks for line in chunk.split(LINE_SEPARATOR)}
         cast_dialogue = len(speakers_in_text) > 1 and speakers_in_text <= {speaker_of(transcript) for transcript, _ in references}
+        caps = [max_frames or AUTO_FRAMES + AUTO_FRAMES_PER_BYTE * len(chunk.encode("utf-8")) for chunk in chunks]
         comfy.model_management.load_models_gpu(model.patchers())
-        progress = comfy.utils.ProgressBar(max_frames * len(chunks))
+        progress = comfy.utils.ProgressBar(sum(caps))
         config = model.config
         separator = model.tokenizer.token_to_id("<|audio_separator|>")
         # taken: (text, frames) of each take with sound; pieces: (script position, lines, codes) decoded as one each
         taken, pieces = [], []
-        # the takes share one expert cache: each starts with what the earlier ones loaded
-        with model.session():
-            for index, chunk in enumerate(chunks):
-                speaker = speaker_of(chunk)
+        # the takes share one expert cache: each starts with what the earlier ones loaded. The longest prompt holds the
+        # references, three earlier takes and its chunk's text
+        longest = (sum(codes.shape[-1] for _, codes in references) + 4 * max(caps)
+                   + max(len(chunk.encode("utf-8")) for chunk in chunks) + 256)
+        # lines decoded in one batch cannot hear each other: they hear the takes of the batches before
+        batch = model.lines_at_once if speakers == "one take per line" else 1
+
+        def heard_speaker(index):
+            """Hearing the line before: the speaker of that line when it is another's, else None."""
+            if speakers == "one take per line, hearing the line before" and taken and speaker_of(taken[-1][0]) != speaker_of(chunks[index]):
+                return speaker_of(taken[-1][0])
+            return None
+
+        def prompt_for(index, heard, voices=None):
+            """The prompt of chunk `index` after the first `heard` takes. `voices`: {speaker: the speaker whose references
+            stand in for theirs}, for the chunk said in other voices."""
+            chunk, speaker = chunks[index], speaker_of(chunks[index])
+            voices = voices or {}
+            if together:
+                said, own = chunk, [] if cast_dialogue else taken
+                lent = {owner: speaker for speaker, owner in voices.items()}
+                cast = [(retag(transcript, lent), codes) for transcript, codes in references]
+            else:
+                # a solo take: the speaker's lines and voices as speaker 0
+                said = as_speaker_0(chunk, speaker)
+                voice = voices.get(speaker, speaker)
+                cast = [(as_speaker_0(transcript, voice), codes) for transcript, codes in references if speaker_of(transcript) == voice]
+                own = [turn for turn in taken[:heard] if speaker_of(turn[0]) == speaker]
+            # the first and the latest take go back into each prompt; separately, those of the take's own speaker
+            history = own[:1] + own[1:][-1:]
+            if heard_speaker(index) is not None:
+                history.append(taken[-1])
+            return chunk_prompt(model, said, cast, [(turn if together else as_speaker_0(turn, speaker), frames) for turn, frames in history])
+
+        def keep(index, chunk_frames):
+            chunk, speaker = chunks[index], speaker_of(chunks[index])
+            # the take's own line separators are text rows
+            audio = chunk_frames[(chunk_frames[:, 0] >= config.semantic_start_token_id) & (chunk_frames[:, 0] <= config.semantic_end_token_id), 1:].T
+            lines = chunk_lines(chunk, index, chunk_frames, 0, config, separator)
+            if positions is None:
+                pieces.append((index, lines, audio))
+            else:
+                if len(lines) < len(positions[index]):
+                    logging.warning("Drama 3: speaker %d's take marked %d of its %d line breaks, so its last %d lines are joined or "
+                                    "missing, out of script order; another seed or one take per line avoids this.", speaker,
+                                    len(lines) - 1, len(positions[index]) - 1, len(positions[index]) - len(lines) + 1)
+                pieces.extend((position, [{**line, "start": 0, "end": line["end"] - line["start"]}], audio[:, line["start"]:line["end"]])
+                              for line, position in zip(lines, positions[index]))
+            if len(chunk_frames):
+                # fish-speech leaves an empty take out of the history, and Fish's builders refuse zero-frame codes
+                taken.append((chunk, chunk_frames))
+
+        rows = min(longest, MAX_PROMPT_ROWS + max(caps))
+        guidance = voice_guidance if speakers in GUIDED_MODES else 0.0
+        # a guided take runs beside its version in another voice
+        width = 2 if guidance else min(batch, len(chunks))
+        with model.session(session_rows(rows, width)):
+            voiced = {speaker_of(transcript) for transcript, _ in references}
+            if guidance and not batchable(model):
+                logging.warning("Drama 3: voice_guidance needs one GPU and ComfyUI after v0.41.2; generating without it.")
+                guidance = 0.0
+
+            def waits(index, beside):
+                """A speaker without a voice gets theirs from their first take: their next line waits for it."""
+                speaker = speaker_of(chunks[index])
+                return (speaker not in voiced and not any(speaker_of(turn) == speaker for turn, _ in taken)
+                        and any(speaker_of(chunks[other]) == speaker for other in beside))
+
+            def contrast_for(index):
+                """The prompt voice guidance steers chunk `index` away from: a line that hears another speaker said in
+                that speaker's voice, a dialogue chunk with its speakers' voices passed round. None without guidance or
+                without a second voice."""
+                if not guidance:
+                    return None
                 if together:
-                    said, cast, own = chunk, references, [] if cast_dialogue else taken
+                    cast = sorted({speaker_of(line) for line in chunks[index].split(LINE_SEPARATOR)} & voiced)
+                    voices = dict(zip(cast, cast[1:] + cast[:1])) if len(cast) > 1 else None
                 else:
-                    # a solo take: the speaker's lines and voices as speaker 0
-                    said = as_speaker_0(chunk, speaker)
-                    cast = [(as_speaker_0(transcript, speaker), codes) for transcript, codes in references if speaker_of(transcript) == speaker]
-                    own = [turn for turn in taken if speaker_of(turn[0]) == speaker]
-                # the first and the latest take go back into each prompt; separately, those of the take's own speaker
-                history = own[:1] + own[1:][-1:]
-                if speakers == "one take per line, hearing the line before" and taken and speaker_of(taken[-1][0]) != speaker:
-                    history.append(taken[-1])
-                prompt = chunk_prompt(model, said, cast, [(turn if together else as_speaker_0(turn, speaker), frames) for turn, frames in history])
+                    voices = {speaker_of(chunks[index]): heard_speaker(index)} if heard_speaker(index) in voiced else None
+                return voices and prompt_for(index, len(taken), voices)
 
-                def on_frame(step, done=index * max_frames):
-                    comfy.model_management.throw_exception_if_processing_interrupted()
-                    progress.update_absolute(done + step + 1)
+            if batch > 1 and batchable(model):
+                # a row whose line has ended takes the next one: a line hears the takes finished before it starts
+                ahead, running = list(range(len(chunks))), set()
 
-                chunk_frames = generate(model, prompt, max_frames, temperature, top_k, top_p, seed + index, on_frame,
-                                        lines=LINE_SEPARATOR in chunk)
-                # the take's own line separators are text rows
-                audio = chunk_frames[(chunk_frames[:, 0] >= config.semantic_start_token_id) & (chunk_frames[:, 0] <= config.semantic_end_token_id), 1:].T
-                lines = chunk_lines(chunk, index, chunk_frames, 0, config, separator)
-                if positions is None:
-                    pieces.append((index, lines, audio))
-                else:
-                    if len(lines) < len(positions[index]):
-                        logging.warning("Drama 3: speaker %d's take marked %d of its %d line breaks, so its last %d lines are joined or "
-                                        "missing, out of script order; another seed or one take per line avoids this.", speaker,
-                                        len(lines) - 1, len(positions[index]) - 1, len(positions[index]) - len(lines) + 1)
-                    pieces += [(position, [{**line, "start": 0, "end": line["end"] - line["start"]}], audio[:, line["start"]:line["end"]])
-                               for line, position in zip(lines, positions[index])]
-                if len(chunk_frames):
-                    # fish-speech leaves an empty take out of the history, and Fish's builders refuse zero-frame codes
-                    taken.append((chunk, chunk_frames))
+                def next_line():
+                    if not ahead or waits(ahead[0], running):
+                        return None
+                    index = ahead.pop(0)
+                    running.add(index)
+                    return index, prompt_for(index, len(taken)), caps[index]
+
+                def keep_line(index, chunk_frames):
+                    running.discard(index)
+                    keep(index, chunk_frames)
+                    progress.update_absolute(sum(caps[other] for other in range(len(chunks)) if other not in running and other not in ahead))
+
+                generate_lines(model, min(batch, len(chunks)), rows, max(caps), next_line, keep_line,
+                               temperature, top_k, top_p, seed, lambda step: comfy.model_management.throw_exception_if_processing_interrupted())
+            else:
+                # one by one; lines of a group of `batch` hear the takes before the group, as they would decoded together
+                first = 0
+                while first < len(chunks):
+                    group = []
+                    for index in range(first, min(first + batch, len(chunks))):
+                        if waits(index, group):
+                            break
+                        group.append(index)
+                    prompts = [prompt_for(index, len(taken)) for index in group]
+                    contrasts = [contrast_for(index) for index in group]
+                    for index, prompt, contrast in zip(group, prompts, contrasts):
+                        def on_frame(step, done=sum(caps[:index])):
+                            comfy.model_management.throw_exception_if_processing_interrupted()
+                            progress.update_absolute(done + step + 1)
+
+                        keep(index, generate(model, prompt, caps[index], temperature, top_k, top_p, seed + index, on_frame,
+                                             lines=LINE_SEPARATOR in chunks[index], contrast=contrast, guidance=guidance))
+                    first += len(group)
         pieces.sort(key=lambda piece: piece[0])
         lines, sound = [], 0
         for _, piece_lines, audio in pieces:
@@ -299,6 +451,43 @@ class Drama3Generate(io.ComfyNode):
         # takes: the frames decoded as one stream each; chunks of one script continue each other's audio
         takes = [sound] if together else [audio.shape[-1] for _, _, audio in pieces]
         return io.NodeOutput({"codes": torch.cat([audio for _, _, audio in pieces], -1).contiguous(), "lines": lines, "takes": takes})
+
+
+class Drama3SpeedOptions(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Drama3SpeedOptions",
+            display_name="Drama 3 Speed Options",
+            category="audio/drama3",
+            description="The speed-ups that change what a seed generates, for you to choose. Put it between Load Drama 3 "
+                        "and Drama 3 Generate. Everything that leaves the takes as they are is always on.",
+            inputs=[
+                Drama3Model.Input("model"),
+                io.Int.Input("lines_at_once", default=1, min=1, max=8,
+                             tooltip="With speakers set to one take per line: decode this many lines side by side; a line that "
+                                     "ends hands its place to the next. Gain: a ten-minute story on an RTX 4090 with W4A8 "
+                                     "takes 225 s at 1, 111 s at 4, 107 s at 8; with FP8 303 s, 199 s, 229 s. Cost: a "
+                                     "line hears its speaker's takes that had finished when it started, not always the line "
+                                     "right before it, and a seed's takes change with this number. Needs one GPU and "
+                                     "ComfyUI after v0.41.2; otherwise the lines run one by one in groups of this many, "
+                                     "hearing the takes before their group."),
+                io.Boolean.Input("repeatable_takes", default=False,
+                                 tooltip="Off: with int8 experts and an expert cache that holds under half of them (cards under "
+                                         "about 20 GB), the CPU computes part of the experts the cache misses: 34 instead of "
+                                         "53 ms per frame with a 4 GB cache on an RTX 4090. Cost: its arithmetic differs from "
+                                         "the GPU's in the last bits and its share depends on timing, so a seed does not give "
+                                         "the same take twice. On: the same seed gives the same take, at the slower speed."),
+            ],
+            outputs=[Drama3Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, lines_at_once, repeatable_takes) -> io.NodeOutput:
+        model = copy.copy(model)
+        model.lines_at_once = lines_at_once
+        model.repeatable = repeatable_takes
+        return io.NodeOutput(model)
 
 
 class Drama3SaveCodes(io.ComfyNode):
@@ -504,7 +693,7 @@ class Qwen3ASRTranscribe(io.ComfyNode):
 
 class Drama3Extension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [Drama3Loader, Drama3CodecLoader, Drama3EncodeVoice, Drama3SaveVoice, Drama3LoadVoice, Drama3Generate, Drama3SaveCodes,
+        return [Drama3Loader, Drama3CodecLoader, Drama3LoadReferenceAudio, Drama3EncodeVoice, Drama3SaveVoice, Drama3LoadVoice, Drama3Generate, Drama3SpeedOptions, Drama3SaveCodes,
                 Drama3LoadCodes, Drama3Decode, Drama3Editor,
                 Qwen3ASRLoader, Qwen3ASRTranscribe]
 

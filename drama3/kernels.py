@@ -22,15 +22,57 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
-__device__ __forceinline__ int warp_sum_int(int v) {
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-
 // Float8 e4m3 to float, subnormals included: the 7 magnitude bits land in the float's exponent and mantissa, 2^120
 // rebiases the exponent.
 __device__ __forceinline__ float e4m3(unsigned int b) {
   return __int_as_float(((b & 0x80u) << 24) | ((b & 0x7Fu) << 20)) * __int_as_float(0x7b800000);
+}
+
+__device__ __forceinline__ float from_bf16(unsigned short b) { return __int_as_float(((unsigned int)b) << 16); }
+
+// Float to bfloat16, to nearest and ties to even, as a cast does.
+__device__ __forceinline__ unsigned short to_bf16(float v) {
+  unsigned int b = (unsigned int)__float_as_int(v);
+  return (unsigned short)((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16);
+}
+
+// A decode row's routing: the k largest of n logits (bfloat16) in descending order (ids) and their softmax weights
+// renormalized over those k, each rounded to bfloat16 as the model's own cast rounds them. n <= 1024, k <= 32.
+extern "C" __global__ void __launch_bounds__(256) route_experts(const unsigned short* logits, int n, int k,
+                                                                long long* ids, float* weights) {
+  __shared__ float value[1024];
+  __shared__ float top[32];
+  __shared__ int top_id[32];
+  __shared__ float total;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) value[i] = from_bf16(logits[i]);
+  if (threadIdx.x < 32) { top[threadIdx.x] = 0.0f; top_id[threadIdx.x] = 0; }
+  __syncthreads();
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    float v = value[i];
+    int rank = 0;
+    for (int j = 0; j < n; j++) rank += value[j] > v || (value[j] == v && j < i);
+    if (rank < k) { top[rank] = v; top_id[rank] = i; }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float sum = 0.0f;
+    for (int e = 0; e < k; e++) sum += expf(top[e] - top[0]);
+    total = sum;
+  }
+  __syncthreads();
+  if (threadIdx.x < k) {
+    weights[threadIdx.x] = from_bf16(to_bf16(expf(top[threadIdx.x] - top[0]) / total));
+    ids[threadIdx.x] = top_id[threadIdx.x];
+  }
+}
+
+// out[h] (bfloat16) = sum over e of parts[e, h] * weights[e]: a decode row's experts mixed by their routing weights.
+extern "C" __global__ void weighted_sum(const float* parts, const float* weights, int k, int H, unsigned short* out) {
+  int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= H) return;
+  float acc = 0.0f;
+  for (int e = 0; e < k; e++) acc += parts[(long long)e * H + h] * weights[e];
+  out[h] = to_bf16(acc);
 }
 
 // The row's experts `ids` [k] of `layer` (of `layers`, `experts` each). Every expert keeps a use count that halves
@@ -177,21 +219,25 @@ extern "C" __global__ void await_cpu(const int* plan, int k, volatile const int*
   for (int i = threadIdx.x; i < H; i += blockDim.x) out[i] = ready ? __int_as_float(((unsigned int)result[i]) << 16) : 0.0f;
 }
 
-// One block per row of x [rows, K] (float; with `swiglu`, [rows, 2K] gate | up, SiLU(gate) * up first): the ConvRot
-// rotation (the regular Hadamard of 256, h4 kron h4 kron h4 kron h4 / 16, per group), then int8 with one scale per row.
-extern "C" __global__ void __launch_bounds__(256) rotate_quantize(const float* x, int swiglu, int K, signed char* q,
-                                                                  float* scale, const int* only_if) {
+// One block per row of x [rows, K] (float, or bfloat16 with `bf16`; with `swiglu`, float [rows, 2K] gate | up, SiLU(gate)
+// * up first): the ConvRot rotation (the regular Hadamard of 256, h4 kron h4 kron h4 kron h4 / 16, per group) into out [rows, K]. The quantized
+// experts are stored in that basis; their input stays in float (rounding it to int8 as well cost the 4-bit files a
+// third of their main-token KL against FP8).
+extern "C" __global__ void __launch_bounds__(256) rotate_rows(const void* x, int bf16, int swiglu, int K, float* out,
+                                                              const int* only_if) {
   __shared__ float row[2048];
-  __shared__ float partial[8];
   int r = blockIdx.x;
   if (!only_if[0]) return;
   for (int i = threadIdx.x; i < K; i += blockDim.x) {
     float v;
     if (swiglu) {
-      float g = x[(long long)r * 2 * K + i], u = x[(long long)r * 2 * K + K + i];
+      const float* f = (const float*)x;
+      float g = f[(long long)r * 2 * K + i], u = f[(long long)r * 2 * K + K + i];
       v = g / (1.0f + __expf(-g)) * u;
+    } else if (bf16) {
+      v = from_bf16(((const unsigned short*)x)[(long long)r * K + i]);
     } else {
-      v = x[(long long)r * K + i];
+      v = ((const float*)x)[(long long)r * K + i];
     }
     row[i] = v;
   }
@@ -208,64 +254,60 @@ extern "C" __global__ void __launch_bounds__(256) rotate_quantize(const float* x
     }
     __syncthreads();
   }
-  float amax = 0.0f;
-  for (int i = threadIdx.x; i < K; i += blockDim.x) {
-    row[i] *= 0.0625f;
-    amax = fmaxf(amax, fabsf(row[i]));
-  }
-  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-  if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = amax;
-  __syncthreads();
-  amax = partial[0];
-  for (int w = 1; w < (blockDim.x >> 5); w++) amax = fmaxf(amax, partial[w]);
-  float s = amax > 0.0f ? amax / 127.0f : 1.0f;
-  for (int i = threadIdx.x; i < K; i += blockDim.x)
-    q[(long long)r * K + i] = (signed char)max(-127, min(127, __float2int_rn(row[i] / s)));
-  if (threadIdx.x == 0) scale[r] = s;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) out[(long long)r * K + i] = row[i] * 0.0625f;
 }
 
-// out[e, n] = expert e's int8 row n . xq[e or 0] * x scale * row scale. Experts with plan fill are read from host
-// memory and copied into their slot; those left to the CPU give zeros. With `late`, only those run (read from host
-// memory) and only if the host was late (took_over); everything else gives zeros. Grid (N / ROWS_PER_BLOCK, k), block
-// 256, shared memory K bytes.
-extern "C" __global__ void __launch_bounds__(256) gemv_int8(const signed char* xq, const float* xscale, int x_rows,
-                                                            const long long* ids, const int* plan, const int* took_over,
-                                                            int late, signed char* slot_w, float* slot_s,
+// The 16 int8 weights of an int4 against 16 floats of a row.
+__device__ __forceinline__ float dot16(int4 q, const float4* x) {
+  int words[4] = {q.x, q.y, q.z, q.w};
+  float acc = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    float4 xv = x[j];
+    int word = words[j];
+    acc += (float)(signed char)word * xv.x + (float)(signed char)(word >> 8) * xv.y +
+           (float)(signed char)(word >> 16) * xv.z + (float)(word >> 24) * xv.w;
+  }
+  return acc;
+}
+
+// out[e, n] = expert e's int8 row n . x[e or 0] * row scale, x in float and rotated. Experts with plan fill are read
+// from host memory and copied into their slot; those left to the CPU give zeros. With `late`, only those run (read from
+// host memory) and only if the host was late (took_over); everything else gives zeros. Grid (N / ROWS_PER_BLOCK, k),
+// block 256, shared memory 4 K bytes.
+extern "C" __global__ void __launch_bounds__(256) gemv_int8(const float* x, int x_rows, const long long* ids,
+                                                            const int* plan, const int* took_over, int late,
+                                                            signed char* slot_w, float* slot_s,
                                                             const signed char* host_w, const float* host_s, float* out,
                                                             int N, int K) {
-  extern __shared__ int4 x_vec[];
+  extern __shared__ float4 xf[];
   int e = blockIdx.y, xr = x_rows == 1 ? 0 : e, code = plan[2 * e + 1];
   if (late ? code != 2 || !took_over[0] : code == 2) {
     if (threadIdx.x < ROWS_PER_BLOCK) out[(long long)e * N + blockIdx.x * ROWS_PER_BLOCK + threadIdx.x] = 0.0f;
     return;
   }
-  const int4* x_src = (const int4*)(xq + (long long)xr * K);
-  for (int i = threadIdx.x; i < K / 16; i += blockDim.x) x_vec[i] = x_src[i];
+  const float4* x_src = (const float4*)(x + (long long)xr * K);
+  for (int i = threadIdx.x; i < K / 4; i += blockDim.x) xf[i] = x_src[i];
   __syncthreads();
   int slot = plan[2 * e], fill = code == 1 && slot >= 0;
   long long id = ids[e];
   const signed char* w = code ? host_w + id * N * K : slot_w + (long long)slot * N * K;
   const float* s = code ? host_s + id * N : slot_s + (long long)slot * N;
-  float xs = xscale[xr];
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   for (int r = 0; r < ROWS_PER_WARP; r++) {
     int n = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP + r;
     const int4* w_row = (const int4*)(w + (long long)n * K);
     int4* dst = (int4*)(slot_w + ((long long)slot * N + n) * K);
-    int acc = 0;
+    float acc = 0.0f;
     for (int v = lane; v < K / 16; v += 32) {
       int4 q = w_row[v];
       if (fill) dst[v] = q;
-      int4 xv = x_vec[v];
-      acc = __dp4a(q.x, xv.x, acc);
-      acc = __dp4a(q.y, xv.y, acc);
-      acc = __dp4a(q.z, xv.z, acc);
-      acc = __dp4a(q.w, xv.w, acc);
+      acc += dot16(q, xf + 4 * v);
     }
-    acc = warp_sum_int(acc);
+    acc = warp_sum(acc);
     if (lane == 0) {
       float row_scale = s[n];
-      out[(long long)e * N + n] = (float)acc * xs * row_scale;
+      out[(long long)e * N + n] = acc * row_scale;
       if (fill) slot_s[(long long)slot * N + n] = row_scale;
     }
   }
@@ -320,14 +362,13 @@ extern "C" __global__ void __launch_bounds__(256) gemv_fp8(const float* x, int x
   }
 }
 
-// Many rows, grouped by expert: group g is (expert, slot, fill, first row, rows) over xq, whose rows are sorted by
-// expert. out[r, n] = row n of the group's expert . xq[r] * x scale[r] * row scale. A group reads its expert from its
+// Many rows, grouped by expert: group g is (expert, slot, fill, first row, rows) over x (float, rotated), whose rows
+// are sorted by expert. out[r, n] = row n of the group's expert . x[r] * row scale. A group reads its expert from its
 // slot, or from host memory when it has no slot (-1) or fills it, copying it in. Grid (N / ROWS_PER_BLOCK, groups),
 // block 256; K <= 2048.
-extern "C" __global__ void __launch_bounds__(256) grouped_int8(const signed char* xq, const float* xscale,
-                                                               const int* groups, signed char* slot_w, float* slot_s,
-                                                               const signed char* host_w, const float* host_s,
-                                                               float* out, int N, int K) {
+extern "C" __global__ void __launch_bounds__(256) grouped_int8(const float* x, const int* groups, signed char* slot_w,
+                                                               float* slot_s, const signed char* host_w,
+                                                               const float* host_s, float* out, int N, int K) {
   const int* group = groups + 5 * blockIdx.y;
   int expert = group[0], slot = group[1], fill = group[2], first = group[3], rows = group[4];
   bool host = slot < 0 || fill;
@@ -351,21 +392,15 @@ extern "C" __global__ void __launch_bounds__(256) grouped_int8(const signed char
     float row_scale = s[n];
     if (fill && lane == 0) slot_s[(long long)slot * N + n] = row_scale;
     for (int t = first; t < first + rows; t++) {
-      const int4* x_row = (const int4*)(xq + (long long)t * K);
-      int acc = 0;
+      const float4* x_row = (const float4*)(x + (long long)t * K);
+      float acc = 0.0f;
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         int v = lane + 32 * i;
-        if (v < vectors) {
-          int4 xv = x_row[v];
-          acc = __dp4a(wv[i].x, xv.x, acc);
-          acc = __dp4a(wv[i].y, xv.y, acc);
-          acc = __dp4a(wv[i].z, xv.z, acc);
-          acc = __dp4a(wv[i].w, xv.w, acc);
-        }
+        if (v < vectors) acc += dot16(wv[i], x_row + 4 * v);
       }
-      acc = warp_sum_int(acc);
-      if (lane == 0) out[(long long)t * N + n] = (float)acc * xscale[t] * row_scale;
+      acc = warp_sum(acc);
+      if (lane == 0) out[(long long)t * N + n] = acc * row_scale;
     }
   }
 }
@@ -459,17 +494,17 @@ __device__ __forceinline__ void copy_codes_row(const unsigned char* w, const uns
 
 // gemv_int8 for W4A8/W6A8 banks (fields: packed rows, e4m3 group scales, per-row channel scales; a 16-entry codebook
 // per bank at 4 bits). A filled expert is copied into its slot first, then read from there.
-extern "C" __global__ void __launch_bounds__(256) gemv_codes(const signed char* xq, const float* xscale, int x_rows,
-                                                             const long long* ids, const int* plan, unsigned char* slot_w,
+extern "C" __global__ void __launch_bounds__(256) gemv_codes(const float* x, int x_rows, const long long* ids,
+                                                             const int* plan, unsigned char* slot_w,
                                                              unsigned char* slot_r, float* slot_c,
                                                              const unsigned char* host_w, const unsigned char* host_r,
                                                              const float* host_c, const float* codebook, int bits,
                                                              float* out, int N, int K) {
-  extern __shared__ int4 x_vec[];
+  extern __shared__ float4 xf[];
   __shared__ float lut[16];
   int e = blockIdx.y, xr = x_rows == 1 ? 0 : e;
-  const int4* x_src = (const int4*)(xq + (long long)xr * K);
-  for (int i = threadIdx.x; i < K / 16; i += blockDim.x) x_vec[i] = x_src[i];
+  const float4* x_src = (const float4*)(x + (long long)xr * K);
+  for (int i = threadIdx.x; i < K / 4; i += blockDim.x) xf[i] = x_src[i];
   if (bits == 4 && threadIdx.x < 16) lut[threadIdx.x] = codebook[threadIdx.x];
   __syncthreads();
   int slot = plan[2 * e], host = plan[2 * e + 1], fill = host && slot >= 0, row_bytes = K * bits / 8, groups = K / 16;
@@ -477,7 +512,6 @@ extern "C" __global__ void __launch_bounds__(256) gemv_codes(const signed char* 
   const unsigned char* w = host ? host_w + id * N * row_bytes : slot_w + (long long)slot * N * row_bytes;
   const unsigned char* r = host ? host_r + id * N * groups : slot_r + (long long)slot * N * groups;
   const float* c = host ? host_c + id * N : slot_c + (long long)slot * N;
-  float xs = xscale[xr];
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   for (int k = 0; k < ROWS_PER_WARP; k++) {
     int n = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP + k;
@@ -490,29 +524,21 @@ extern "C" __global__ void __launch_bounds__(256) gemv_codes(const signed char* 
       w_row = dw;
       r_row = dr;
     }
-    int acc = 0;
-    for (int v = lane; v < K / 16; v += 32) {
-      int4 q = decode_codes(w_row, r_row[v], v, K, bits, lut);
-      int4 xv = x_vec[v];
-      acc = __dp4a(q.x, xv.x, acc);
-      acc = __dp4a(q.y, xv.y, acc);
-      acc = __dp4a(q.z, xv.z, acc);
-      acc = __dp4a(q.w, xv.w, acc);
-    }
-    acc = warp_sum_int(acc);
+    float acc = 0.0f;
+    for (int v = lane; v < K / 16; v += 32) acc += dot16(decode_codes(w_row, r_row[v], v, K, bits, lut), xf + 4 * v);
+    acc = warp_sum(acc);
     if (lane == 0) {
       float channel = c[n];
-      out[(long long)e * N + n] = (float)acc * xs * channel;
+      out[(long long)e * N + n] = acc * channel;
       if (fill) slot_c[(long long)slot * N + n] = channel;
     }
   }
 }
 
 // grouped_int8 for W4A8/W6A8 banks (see gemv_codes); K <= 2048.
-extern "C" __global__ void __launch_bounds__(256) grouped_codes(const signed char* xq, const float* xscale,
-                                                                const int* groups, unsigned char* slot_w,
-                                                                unsigned char* slot_r, float* slot_c,
-                                                                const unsigned char* host_w,
+extern "C" __global__ void __launch_bounds__(256) grouped_codes(const float* x, const int* groups,
+                                                                unsigned char* slot_w, unsigned char* slot_r,
+                                                                float* slot_c, const unsigned char* host_w,
                                                                 const unsigned char* host_r, const float* host_c,
                                                                 const float* codebook, int bits, float* out, int N,
                                                                 int K) {
@@ -547,21 +573,15 @@ extern "C" __global__ void __launch_bounds__(256) grouped_codes(const signed cha
     float channel = c[n];
     if (fill && lane == 0) slot_c[(long long)slot * N + n] = channel;
     for (int t = first; t < first + rows; t++) {
-      const int4* x_row = (const int4*)(xq + (long long)t * K);
-      int acc = 0;
+      const float4* x_row = (const float4*)(x + (long long)t * K);
+      float acc = 0.0f;
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         int v = lane + 32 * i;
-        if (v < vectors) {
-          int4 xv = x_row[v];
-          acc = __dp4a(wv[i].x, xv.x, acc);
-          acc = __dp4a(wv[i].y, xv.y, acc);
-          acc = __dp4a(wv[i].z, xv.z, acc);
-          acc = __dp4a(wv[i].w, xv.w, acc);
-        }
+        if (v < vectors) acc += dot16(wv[i], x_row + 4 * v);
       }
-      acc = warp_sum_int(acc);
-      if (lane == 0) out[(long long)t * N + n] = (float)acc * xscale[t] * channel;
+      acc = warp_sum(acc);
+      if (lane == 0) out[(long long)t * N + n] = acc * channel;
     }
   }
 }
@@ -587,7 +607,7 @@ def available(device):
     if device.type != "cuda":
         return False
     try:
-        for name in ("resolve_experts", "rotate_quantize", "gemv_int8", "gemv_fp8", "grouped_int8", "grouped_fp8", "await_cpu", "gemv_codes",
+        for name in ("route_experts", "weighted_sum", "resolve_experts", "rotate_rows", "gemv_int8", "gemv_fp8", "grouped_int8", "grouped_fp8", "await_cpu", "gemv_codes",
                      "grouped_codes"):
             _kernel(name, device.index)
     except (AttributeError, RuntimeError, OSError):  # PyTorch without the NVRTC helper, or NVRTC missing
@@ -613,24 +633,41 @@ def await_cpu(plan, flag, step, result, timeout_us, took_over):
     return out
 
 
-def rotate_quantize(x, only_if, swiglu=False):
-    """Rows of x [rows, K] (float32; [rows, 2K] with `swiglu`) rotated and quantized: (int8 [rows, K], scale [rows]).
-    Only when `only_if` (an int32 on the GPU) is set; otherwise the outputs are left unset."""
+def rotate(x, only_if, swiglu=False):
+    """Rows of x [rows, K] (float32 or bfloat16; float32 [rows, 2K] gate | up with `swiglu`, SiLU(gate) * up first) in the
+    ConvRot basis: float32 [rows, K]. Only when `only_if` (an int32 on the GPU) is set; otherwise the output is left
+    unset."""
     rows, width = x.shape
     k = width // 2 if swiglu else width
-    q = torch.empty((rows, k), dtype=torch.int8, device=x.device)
-    scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
-    _launch("rotate_quantize", x.device, (rows, 1, 1), (256, 1, 1), [x, int(swiglu), k, q, scale, only_if])
-    return q, scale
+    out = torch.empty((rows, k), dtype=torch.float32, device=x.device)
+    _launch("rotate_rows", x.device, (rows, 1, 1), (256, 1, 1), [x, int(x.dtype == torch.bfloat16), int(swiglu), k, out, only_if])
+    return out
 
 
-def gemv_int8(xq, xscale, ids, plan, took_over, late, slot_fields, host_fields, n):
-    """[k, n] float32: each expert's int8 rows against xq [1 or k, K]; fields are {"_qdata", "scale"}."""
-    k, width = ids.shape[0], xq.shape[1]
-    out = torch.empty((k, n), dtype=torch.float32, device=xq.device)
-    _launch("gemv_int8", xq.device, (n // ROWS_PER_BLOCK, k, 1), (256, 1, 1),
-            [xq, xscale, xq.shape[0], ids, plan, took_over, int(late), slot_fields["_qdata"], slot_fields["scale"],
-             host_fields["_qdata"], host_fields["scale"], out, n, width], shared_mem=width)
+def route(logits, k):
+    """(ids [1, k] int64, weights [1, k] float32) of one row of router logits [1, n] (bfloat16): the k largest, by
+    descending logit, and their softmax weights renormalized over them, rounded to bfloat16."""
+    ids = torch.empty((1, k), dtype=torch.int64, device=logits.device)
+    weights = torch.empty((1, k), dtype=torch.float32, device=logits.device)
+    _launch("route_experts", logits.device, (1, 1, 1), (256, 1, 1), [logits, logits.shape[1], k, ids, weights])
+    return ids, weights
+
+
+def weighted_sum(parts, weights):
+    """[1, H] bfloat16: parts [k, H] (float32) summed by weights [k] (float32)."""
+    out = torch.empty((1, parts.shape[1]), dtype=torch.bfloat16, device=parts.device)
+    _launch("weighted_sum", parts.device, ((parts.shape[1] + 255) // 256, 1, 1), (256, 1, 1),
+            [parts, weights, parts.shape[0], parts.shape[1], out])
+    return out
+
+
+def gemv_int8(x, ids, plan, took_over, late, slot_fields, host_fields, n):
+    """[k, n] float32: each expert's int8 rows against x [1 or k, K] (float32, rotated); fields are {"_qdata", "scale"}."""
+    k, width = ids.shape[0], x.shape[1]
+    out = torch.empty((k, n), dtype=torch.float32, device=x.device)
+    _launch("gemv_int8", x.device, (n // ROWS_PER_BLOCK, k, 1), (256, 1, 1),
+            [x, x.shape[0], ids, plan, took_over, int(late), slot_fields["_qdata"], slot_fields["scale"],
+             host_fields["_qdata"], host_fields["scale"], out, n, width], shared_mem=4 * width)
     return out
 
 
@@ -644,13 +681,13 @@ def gemv_fp8(x, ids, plan, slot_fields, host_fields, n):
     return out
 
 
-def grouped_int8(xq, xscale, groups, slot_fields, host_fields, n):
-    """[rows, n] float32 for xq's rows (sorted by expert) through their experts; groups [g, 5] int32 as grouped_int8.
-    Rows outside every group are left unset."""
-    out = torch.empty((xq.shape[0], n), dtype=torch.float32, device=xq.device)
-    _launch("grouped_int8", xq.device, (n // ROWS_PER_BLOCK, groups.shape[0], 1), (256, 1, 1),
-            [xq, xscale, groups, slot_fields["_qdata"], slot_fields["scale"], host_fields["_qdata"], host_fields["scale"],
-             out, n, xq.shape[1]])
+def grouped_int8(x, groups, slot_fields, host_fields, n):
+    """[rows, n] float32 for x's rows (float32, rotated, sorted by expert) through their experts; groups [g, 5] int32 as
+    grouped_int8. Rows outside every group are left unset."""
+    out = torch.empty((x.shape[0], n), dtype=torch.float32, device=x.device)
+    _launch("grouped_int8", x.device, (n // ROWS_PER_BLOCK, groups.shape[0], 1), (256, 1, 1),
+            [x, groups, slot_fields["_qdata"], slot_fields["scale"], host_fields["_qdata"], host_fields["scale"], out, n,
+             x.shape[1]])
     return out
 
 
@@ -663,25 +700,25 @@ def grouped_fp8(x, groups, slot_fields, host_fields, n):
     return out
 
 
-def gemv_codes(xq, xscale, ids, plan, slot_fields, host_fields, codebook, bits, n):
+def gemv_codes(x, ids, plan, slot_fields, host_fields, codebook, bits, n):
     """gemv_int8 for W4A8/W6A8 banks; fields are {"_qdata", "scale" (e4m3), "s_channel"}, codebook [16] at 4 bits."""
-    k, width = ids.shape[0], xq.shape[1]
+    k, width = ids.shape[0], x.shape[1]
     if codebook is None:
         codebook = host_fields["s_channel"]  # never read at 6 bits; the launcher needs a pointer
-    out = torch.empty((k, n), dtype=torch.float32, device=xq.device)
-    _launch("gemv_codes", xq.device, (n // ROWS_PER_BLOCK, k, 1), (256, 1, 1),
-            [xq, xscale, xq.shape[0], ids, plan, slot_fields["_qdata"], slot_fields["scale"], slot_fields["s_channel"],
+    out = torch.empty((k, n), dtype=torch.float32, device=x.device)
+    _launch("gemv_codes", x.device, (n // ROWS_PER_BLOCK, k, 1), (256, 1, 1),
+            [x, x.shape[0], ids, plan, slot_fields["_qdata"], slot_fields["scale"], slot_fields["s_channel"],
              host_fields["_qdata"], host_fields["scale"], host_fields["s_channel"], codebook, bits, out, n, width],
-            shared_mem=width)
+            shared_mem=4 * width)
     return out
 
 
-def grouped_codes(xq, xscale, groups, slot_fields, host_fields, codebook, bits, n):
+def grouped_codes(x, groups, slot_fields, host_fields, codebook, bits, n):
     """grouped_int8 for W4A8/W6A8 banks (see gemv_codes)."""
-    out = torch.empty((xq.shape[0], n), dtype=torch.float32, device=xq.device)
+    out = torch.empty((x.shape[0], n), dtype=torch.float32, device=x.device)
     if codebook is None:
         codebook = host_fields["s_channel"]  # never read at 6 bits
-    _launch("grouped_codes", xq.device, (n // ROWS_PER_BLOCK, groups.shape[0], 1), (256, 1, 1),
-            [xq, xscale, groups, slot_fields["_qdata"], slot_fields["scale"], slot_fields["s_channel"], host_fields["_qdata"],
-             host_fields["scale"], host_fields["s_channel"], codebook, bits, out, n, xq.shape[1]])
+    _launch("grouped_codes", x.device, (n // ROWS_PER_BLOCK, groups.shape[0], 1), (256, 1, 1),
+            [x, groups, slot_fields["_qdata"], slot_fields["scale"], slot_fields["s_channel"], host_fields["_qdata"],
+             host_fields["scale"], host_fields["s_channel"], codebook, bits, out, n, x.shape[1]])
     return out

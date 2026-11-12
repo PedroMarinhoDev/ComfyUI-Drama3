@@ -48,12 +48,14 @@ def speaker_of(text):
     return int(tag.group(1)) if tag else 0
 
 
+def retag(text, mapping):
+    """`text` with each speaker in `mapping` renumbered by it; the others keep their tags."""
+    return SPEAKER_TAG.sub(lambda tag: f"<|speaker:{mapping.get(int(tag.group(1)), int(tag.group(1)))}|>", text)
+
+
 def as_speaker_0(text, speaker):
     """`text` with speakers `speaker` and 0 swapped, so that `speaker` speaks as speaker 0 and the others keep distinct tags."""
-    def swap(tag):
-        number = int(tag.group(1))
-        return f"<|speaker:{0 if number == speaker else speaker if number == 0 else number}|>"
-    return SPEAKER_TAG.sub(swap, text)
+    return retag(text, {speaker: 0, 0: speaker})
 
 
 def audio_rows(codes, config):

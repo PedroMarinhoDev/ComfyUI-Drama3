@@ -11,13 +11,13 @@ import comfy.model_patcher
 import comfy.ops
 import comfy.utils
 from .codec import Drama3Codec
-from .config import parse_config
+from .config import LINE_HEAD_IDS, LINE_HEAD_KEY, parse_config
 from .model import Drama3Model, SecondGPU
-from .offload import ExpertStore
+from .offload import ExpertStore, HostEmbedding
 
 TOKENIZER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fish", "tokenizer.json")
-# The LM head rows of the newline and <|audio_separator|>, which the converted files leave out: a dialogue's take says
-# them between its lines.
+# The LM head rows of the newline and <|audio_separator|> of the first release, which its converted files leave out: a
+# dialogue's take says them between its lines.
 LINE_HEAD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fish", "line_head.safetensors")
 # What each card keeps besides its share of the layers: the first card holds the embedding table, the second the
 # head, the tower and the caches.
@@ -36,7 +36,7 @@ class _OpsConfig:
 class Drama3:
     """A loaded Drama 3: its patchers, where each part runs, the tokenizer, and the (ids, rows) of the line head."""
 
-    def __init__(self, model, patcher, second=None, second_patcher=None, experts=None):
+    def __init__(self, model, patcher, line_head, second=None, second_patcher=None, experts=None):
         from tokenizers import Tokenizer
         self.model = model
         self.patcher = patcher
@@ -44,8 +44,13 @@ class Drama3:
         self.second_patcher = second_patcher
         self.experts = experts
         self.tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-        line_head = comfy.utils.load_torch_file(LINE_HEAD_PATH)
-        self.line_head = (line_head["ids"], line_head["weight"])
+        self.line_head = (torch.tensor(LINE_HEAD_IDS), line_head)
+        # how many separately generated lines are decoded in one batch (Drama 3 Speed Options): a line then hears its
+        # speaker's latest take of the batch before, not the line before it
+        self.lines_at_once = 1
+        # the same seed gives the same take on every run: no experts are left to the CPU, whose arithmetic differs from
+        # the kernels' in the last bits and whose share of a step depends on timing
+        self.repeatable = False
 
     @property
     def config(self):
@@ -54,11 +59,12 @@ class Drama3:
     def patchers(self):
         return [p for p in (self.patcher, self.second_patcher) if p is not None]
 
-    def session(self):
-        """One generation's hold on the expert cache (experts in RAM): takes inside it share what earlier ones loaded."""
+    def session(self, rows):
+        """One generation's hold on the expert cache (experts in RAM): takes inside it share what earlier ones loaded.
+        `rows`: the most rows, prompt and frames, a take inside it can reach."""
         if self.experts is None:
             return contextlib.nullcontext()
-        return self.experts.session(self.patcher.load_device, self.patchers(), cpu_decode=self.second is None)
+        return self.experts.session(self.patcher.load_device, self.patchers(), self.second is None, rows, not self.repeatable)
 
     def parts(self):
         """(layers, layer devices, final norm, audio head, tower): the head and tower run on the last device."""
@@ -103,6 +109,7 @@ def load_drama3(path, second_device=None, split=0, experts_in_ram=False, expert_
         raise ValueError(f"{os.path.basename(path)} is not a converted Drama 3 file (tools/convert.py model)")
     config = parse_config(json.loads(metadata["drama3_config"]))
     config.fp8_experts = metadata.get("drama3_format") == "fp8"
+    line_head = state.pop(LINE_HEAD_KEY) if LINE_HEAD_KEY in state else comfy.utils.load_torch_file(LINE_HEAD_PATH)["weight"]
     quant_config = comfy.utils.detect_layer_quantization(state, "")
     dtype = torch.bfloat16
     load_device = comfy.model_management.get_torch_device()
@@ -120,15 +127,17 @@ def load_drama3(path, second_device=None, split=0, experts_in_ram=False, expert_
         experts = ExpertStore(int(expert_cache_gb * 1024 ** 3))
         for layer in model.model.layers:
             layer.mlp.experts = experts.add(layer.mlp.experts)
+        model.model.embed_tokens = HostEmbedding(model.model.embed_tokens)
+        model.evictable = []
     if second_device is None:
-        return Drama3(model, patcher, experts=experts)
+        return Drama3(model, patcher, line_head, experts=experts)
 
     first = split or auto_split(model, load_device, second_device)
     second = SecondGPU(model, first)
     second_patcher = comfy.model_patcher.CoreModelPatcher(second, load_device=second_device, offload_device=offload_device)
     logging.info("Drama 3: layers 0-%d on %s, layers %d-%d, head and tower on %s", first - 1, load_device, first,
                  config.text.num_hidden_layers - 1, second_device)
-    return Drama3(model, patcher, second, second_patcher, experts)
+    return Drama3(model, patcher, line_head, second, second_patcher, experts)
 
 
 class Codec:

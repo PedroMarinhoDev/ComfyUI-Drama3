@@ -6,6 +6,11 @@ from comfy.text_encoders.qwen35 import Qwen35Config
 # The converted file keeps only the LM head rows a frame's main token is drawn from: end of speech, then the
 # 4096 semantic tokens. Row 0 is end of speech, row 1 + c is semantic code c.
 AUDIO_HEAD_KEY = "audio_head.weight"
+# ...and, in files converted since the 2026-10-29 weights, the rows of the newline and <|audio_separator|> under this
+# key: a dialogue's take says them between its lines. Older files use the rows shipped in fish/line_head.safetensors,
+# which are the first release's.
+LINE_HEAD_KEY = "line_head.weight"
+LINE_HEAD_IDS = (198, 252196)
 
 # Repetition-aware sampling of the main token, fixed by the training recipe: when the first draw repeats one of
 # the last RAS_WINDOW main tokens, a second draw with these parameters is used instead.

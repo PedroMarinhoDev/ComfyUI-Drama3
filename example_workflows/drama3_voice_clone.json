@@ -22,10 +22,10 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "## Fish Audio Drama 3 · voice cloning\n\n**Files**\n\n| File | Folder |\n|---|---|\n| drama3_fp8experts_bf16.safetensors (38.6 GB, the original FP8 experts)<br>or drama3_int8experts_bf16.safetensors (38.7 GB, faster on cards under 24 GB)<br>or drama3_w6a8experts_bf16.safetensors (32.7 GB)<br>or drama3_w4a8experts_bf16.safetensors (24.6 GB, falls silent more often) | models/diffusion_models |\n| drama3_codec.safetensors | models/vae |\n| qwen3_asr_1.7b_bf16.safetensors (4.1 GB)<br>or qwen3_asr_0.6b_bf16.safetensors (1.6 GB) | models/asr |\n\nDownload them from [Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI) and [Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI).\n\n**How to use:** pick a voice in **Load Audio** (a few seconds of clean speech, cut between sentences). **Qwen3-ASR Transcribe** writes what it says into **Drama 3 Encode Voice**; to type the transcript yourself, delete that link. Write your text in **Drama 3 Generate**; cues such as [sighs], [laughs] or [whispers] go where the sound should be.\n\n**Keep a voice:** un-mute **Save Drama 3 Voice** (select it, Ctrl+M) and queue once: the voice goes to output/drama3_voices. Next time use **Load Drama 3 Voice** in place of Load Audio, Qwen3-ASR and Encode Voice.\n\n**Dialogue:** add a second Load Audio + Encode Voice (a new voice socket appears on Generate as you connect one), connect it to the next voice slot (the voice in slot voice1 speaks for speaker 1), and start each line of the text with <|speaker:0|> or <|speaker:1|>.\n\n**Settings:** temperature 1.0, top_p 0.9, top_k 0 (no cap) are the defaults of Fish Audio's Drama 3 Space; top_k 30, their server's default, makes takes fall silent at pauses, and lower temperature or top_p make that more likely. **experts: in RAM** keeps the 32 GB of experts in system RAM and caches the ones in use in VRAM (expert_cache_gb 0 = all free VRAM): about 20-25 ms per frame on an RTX 3090 or 4090, where 46 ms is real time.\n\n**If a take goes silent** before the end, it is stopped and its silence cut (a warning in the console): queue again for a new seed. Without a voice this happens often; with a voice, a clip that keeps doing it is a poor reference: try another stretch of the recording."
+        "## Fish Audio Drama 3 · voice cloning\n\n**Files**\n\n| File | Folder |\n|---|---|\n| drama3_fp8experts_bf16.safetensors (38.6 GB, the original FP8 experts)<br>or drama3_int8experts_bf16.safetensors (38.7 GB, faster on cards under 24 GB)<br>or drama3_w6a8experts_bf16.safetensors (32.7 GB)<br>or drama3_w4a8experts_bf16.safetensors (24.6 GB, falls silent more often) | models/diffusion_models |\n| drama3_codec.safetensors | models/vae |\n| qwen3_asr_1.7b_bf16.safetensors (4.1 GB)<br>or qwen3_asr_0.6b_bf16.safetensors (1.6 GB) | models/asr |\n\nDownload them from [Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI) and [Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI).\n\n**How to use:** pick a voice in **Load Reference Audio**: clean speech; it trims the clip's silent edges and cuts it in a pause to `length` (20 s by default; Fish Audio recommends 10-30 s). **Qwen3-ASR Transcribe** writes what it says into **Drama 3 Encode Voice**; to type the transcript yourself, delete that link. Write your text in **Drama 3 Generate**; cues such as [sighs], [laughs] or [whispers] go where the sound should be.\n\n**Keep a voice:** un-mute **Save Drama 3 Voice** (select it, Ctrl+M) and queue once: the voice goes to output/drama3_voices. Next time use **Load Drama 3 Voice** in place of Load Reference Audio, Qwen3-ASR and Encode Voice.\n\n**Dialogue:** add a second Load Reference Audio + Encode Voice (a new voice socket appears on Generate as you connect one), connect it to the next voice slot (the voice in slot voice1 speaks for speaker 1), and start each line of the text with <|speaker:0|> or <|speaker:1|>.\n\n**Settings:** temperature 1.0, top_p 0.9, top_k 0 (no cap) are the defaults of Fish Audio's Drama 3 Space; top_k 30, their server's default, makes takes fall silent at pauses, and lower temperature or top_p make that more likely. **experts: in RAM** keeps the 32 GB of experts in system RAM and caches the ones in use in VRAM (expert_cache_gb 0 = all free VRAM): about 20-25 ms per frame on an RTX 3090 or 4090, where 46 ms is real time.\n\n**If a take goes silent** before the end, it is stopped and its silence cut (a warning in the console): queue again for a new seed. Without a voice this happens often; with a voice, a clip that keeps doing it is a poor reference: try another stretch of the recording."
       ],
       "widgets_values_named": {
-        "text": "## Fish Audio Drama 3 · voice cloning\n\n**Files**\n\n| File | Folder |\n|---|---|\n| drama3_fp8experts_bf16.safetensors (38.6 GB, the original FP8 experts)<br>or drama3_int8experts_bf16.safetensors (38.7 GB, faster on cards under 24 GB)<br>or drama3_w6a8experts_bf16.safetensors (32.7 GB)<br>or drama3_w4a8experts_bf16.safetensors (24.6 GB, falls silent more often) | models/diffusion_models |\n| drama3_codec.safetensors | models/vae |\n| qwen3_asr_1.7b_bf16.safetensors (4.1 GB)<br>or qwen3_asr_0.6b_bf16.safetensors (1.6 GB) | models/asr |\n\nDownload them from [Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI) and [Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI).\n\n**How to use:** pick a voice in **Load Audio** (a few seconds of clean speech, cut between sentences). **Qwen3-ASR Transcribe** writes what it says into **Drama 3 Encode Voice**; to type the transcript yourself, delete that link. Write your text in **Drama 3 Generate**; cues such as [sighs], [laughs] or [whispers] go where the sound should be.\n\n**Keep a voice:** un-mute **Save Drama 3 Voice** (select it, Ctrl+M) and queue once: the voice goes to output/drama3_voices. Next time use **Load Drama 3 Voice** in place of Load Audio, Qwen3-ASR and Encode Voice.\n\n**Dialogue:** add a second Load Audio + Encode Voice (a new voice socket appears on Generate as you connect one), connect it to the next voice slot (the voice in slot voice1 speaks for speaker 1), and start each line of the text with <|speaker:0|> or <|speaker:1|>.\n\n**Settings:** temperature 1.0, top_p 0.9, top_k 0 (no cap) are the defaults of Fish Audio's Drama 3 Space; top_k 30, their server's default, makes takes fall silent at pauses, and lower temperature or top_p make that more likely. **experts: in RAM** keeps the 32 GB of experts in system RAM and caches the ones in use in VRAM (expert_cache_gb 0 = all free VRAM): about 20-25 ms per frame on an RTX 3090 or 4090, where 46 ms is real time.\n\n**If a take goes silent** before the end, it is stopped and its silence cut (a warning in the console): queue again for a new seed. Without a voice this happens often; with a voice, a clip that keeps doing it is a poor reference: try another stretch of the recording."
+        "text": "## Fish Audio Drama 3 · voice cloning\n\n**Files**\n\n| File | Folder |\n|---|---|\n| drama3_fp8experts_bf16.safetensors (38.6 GB, the original FP8 experts)<br>or drama3_int8experts_bf16.safetensors (38.7 GB, faster on cards under 24 GB)<br>or drama3_w6a8experts_bf16.safetensors (32.7 GB)<br>or drama3_w4a8experts_bf16.safetensors (24.6 GB, falls silent more often) | models/diffusion_models |\n| drama3_codec.safetensors | models/vae |\n| qwen3_asr_1.7b_bf16.safetensors (4.1 GB)<br>or qwen3_asr_0.6b_bf16.safetensors (1.6 GB) | models/asr |\n\nDownload them from [Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI) and [Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI).\n\n**How to use:** pick a voice in **Load Reference Audio**: clean speech; it trims the clip's silent edges and cuts it in a pause to `length` (20 s by default; Fish Audio recommends 10-30 s). **Qwen3-ASR Transcribe** writes what it says into **Drama 3 Encode Voice**; to type the transcript yourself, delete that link. Write your text in **Drama 3 Generate**; cues such as [sighs], [laughs] or [whispers] go where the sound should be.\n\n**Keep a voice:** un-mute **Save Drama 3 Voice** (select it, Ctrl+M) and queue once: the voice goes to output/drama3_voices. Next time use **Load Drama 3 Voice** in place of Load Reference Audio, Qwen3-ASR and Encode Voice.\n\n**Dialogue:** add a second Load Reference Audio + Encode Voice (a new voice socket appears on Generate as you connect one), connect it to the next voice slot (the voice in slot voice1 speaks for speaker 1), and start each line of the text with <|speaker:0|> or <|speaker:1|>.\n\n**Settings:** temperature 1.0, top_p 0.9, top_k 0 (no cap) are the defaults of Fish Audio's Drama 3 Space; top_k 30, their server's default, makes takes fall silent at pauses, and lower temperature or top_p make that more likely. **experts: in RAM** keeps the 32 GB of experts in system RAM and caches the ones in use in VRAM (expert_cache_gb 0 = all free VRAM): about 20-25 ms per frame on an RTX 3090 or 4090, where 46 ms is real time.\n\n**If a take goes silent** before the end, it is stopped and its silence cut (a warning in the console): queue again for a new seed. Without a voice this happens often; with a voice, a clip that keeps doing it is a poor reference: try another stretch of the recording."
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -167,14 +167,14 @@
     },
     {
       "id": 4,
-      "type": "LoadAudio",
+      "type": "Drama3LoadReferenceAudio",
       "pos": [
         620,
         380
       ],
       "size": [
         360,
-        136
+        230
       ],
       "flags": {},
       "order": 3,
@@ -206,6 +206,24 @@
             "name": "upload"
           },
           "link": null
+        },
+        {
+          "localized_name": "trim",
+          "name": "trim",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "trim"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "length",
+          "name": "length",
+          "type": "COMBO",
+          "widget": {
+            "name": "length"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -220,15 +238,19 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "LoadAudio"
+        "Node name for S&R": "Drama3LoadReferenceAudio"
       },
       "widgets_values": [
         "drama3_example_voice.wav",
-        ""
+        "",
+        true,
+        "20 s"
       ],
       "widgets_values_named": {
         "audio": "drama3_example_voice.wav",
-        "upload": ""
+        "upload": "",
+        "trim": true,
+        "length": "20 s"
       }
     },
     {
@@ -408,7 +430,7 @@
         1,
         0.9,
         0,
-        600,
+        0,
         true
       ],
       "widgets_values_named": {
@@ -525,7 +547,7 @@
       "type": "Qwen3ASRLoader",
       "pos": [
         620,
-        560
+        660
       ],
       "size": [
         360,

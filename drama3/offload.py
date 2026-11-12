@@ -25,7 +25,12 @@ import comfy.ops
 from comfy.quant_ops import QuantizedTensor
 from . import kernels
 
-CACHE_RESERVE = 2 * 1024 ** 3
+# VRAM a generation needs besides the model and the cache: a prompt's pass and the KV caches grow with the rows
+# (0.29 MiB per row on prompts of 200 to 3,900 rows), on top of the kernels' and graphs' own memory
+RESERVE_BASE = 512 * 1024 ** 2
+RESERVE_PER_ROW = 0.3 * 1024 ** 2
+# comfy_aimdo reads the device's free memory at most every 2 s: after this long its next reading is a new one
+EVICTION_PAUSE = 2.0
 FP8_BLOCK = 128
 # a prompt's pass splits its uncached int8 experts between the CPU and the GPU by these costs (an i9-14900K and PCIe
 # 4.0 x8), which each pass then scales by what it measured
@@ -85,18 +90,19 @@ def kernel_bank(weight):
     return None
 
 
-def quantized_gemv(kind, xq, xscale, ids, plan, took_over, late, slot_fields, host_fields, rows, codebook):
-    """[k, rows]: a decode row's experts in an int8, W4A8 or W6A8 bank (see kernels.gemv_int8 / gemv_codes)."""
+def quantized_gemv(kind, x, ids, plan, took_over, late, slot_fields, host_fields, rows, codebook):
+    """[k, rows]: a decode row's experts in an int8, W4A8 or W6A8 bank against x (float32, rotated; see
+    kernels.gemv_int8 / gemv_codes)."""
     if kind == "int8":
-        return kernels.gemv_int8(xq, xscale, ids, plan, took_over, late, slot_fields, host_fields, rows)
-    return kernels.gemv_codes(xq, xscale, ids, plan, slot_fields, host_fields, codebook, int(kind[1]), rows)
+        return kernels.gemv_int8(x, ids, plan, took_over, late, slot_fields, host_fields, rows)
+    return kernels.gemv_codes(x, ids, plan, slot_fields, host_fields, codebook, int(kind[1]), rows)
 
 
-def quantized_grouped(kind, xq, xscale, groups, slot_fields, host_fields, rows, codebook):
+def quantized_grouped(kind, x, groups, slot_fields, host_fields, rows, codebook):
     """quantized_gemv for a prompt's rows (see kernels.grouped_int8 / grouped_codes)."""
     if kind == "int8":
-        return kernels.grouped_int8(xq, xscale, groups, slot_fields, host_fields, rows)
-    return kernels.grouped_codes(xq, xscale, groups, slot_fields, host_fields, codebook, int(kind[1]), rows)
+        return kernels.grouped_int8(x, groups, slot_fields, host_fields, rows)
+    return kernels.grouped_codes(x, groups, slot_fields, host_fields, codebook, int(kind[1]), rows)
 
 
 def resident_decode(x, ids, weights, banks, rows, kind, codebooks):
@@ -105,18 +111,16 @@ def resident_decode(x, ids, weights, banks, rows, kind, codebooks):
     place, nothing waiting on the host."""
     (gate_up, down), (gate_up_rows, down_rows) = banks, rows
     plan = torch.stack((ids.to(torch.int32), torch.zeros_like(ids, dtype=torch.int32)), dim=-1)
-    weights = weights[:, None].float()
     if kind == "fp8":
         gate, up = kernels.gemv_fp8(x.float(), ids, plan, gate_up, gate_up, gate_up_rows).chunk(2, dim=-1)
         out = kernels.gemv_fp8(nn.functional.silu(gate) * up, ids, plan, down, down, down_rows)
-        return (out * weights).sum(0, keepdim=True).to(x.dtype)
-    # no expert is left to the CPU (took_over 0); the quantizer always runs (1)
+        return kernels.weighted_sum(out, weights.float())
+    # no expert is left to the CPU (took_over 0); the rotation always runs (1)
     took_over, always = torch.arange(2, dtype=torch.int32, device=x.device).split(1)
-    xq, xscale = kernels.rotate_quantize(x.float(), always)
-    hidden = quantized_gemv(kind, xq, xscale, ids, plan, took_over, False, gate_up, gate_up, gate_up_rows, codebooks[0])
-    hq, hscale = kernels.rotate_quantize(hidden, always, swiglu=True)
-    out = quantized_gemv(kind, hq, hscale, ids, plan, took_over, False, down, down, down_rows, codebooks[1])
-    return (out * weights).sum(0, keepdim=True).to(x.dtype)
+    hidden = quantized_gemv(kind, kernels.rotate(x, always), ids, plan, took_over, False, gate_up, gate_up, gate_up_rows, codebooks[0])
+    out = quantized_gemv(kind, kernels.rotate(hidden, always, swiglu=True), ids, plan, took_over, False, down, down, down_rows,
+                         codebooks[1])
+    return kernels.weighted_sum(out, weights.float())
 
 
 def grouped_experts(sorted_x, groups, slot_banks, host_banks, rows, kind, codebooks, always):
@@ -125,10 +129,10 @@ def grouped_experts(sorted_x, groups, slot_banks, host_banks, rows, kind, codebo
     if kind == "fp8":
         gate, up = kernels.grouped_fp8(sorted_x.float(), groups, slot_banks[0], host_banks[0], rows[0]).chunk(2, dim=-1)
         return kernels.grouped_fp8(nn.functional.silu(gate) * up, groups, slot_banks[1], host_banks[1], rows[1])
-    xq, xscale = kernels.rotate_quantize(sorted_x.float(), always)
-    hidden = quantized_grouped(kind, xq, xscale, groups, slot_banks[0], host_banks[0], rows[0], codebooks[0])
-    hq, hscale = kernels.rotate_quantize(hidden, always, swiglu=True)
-    return quantized_grouped(kind, hq, hscale, groups, slot_banks[1], host_banks[1], rows[1], codebooks[1])
+    hidden = quantized_grouped(kind, kernels.rotate(sorted_x.float(), always), groups, slot_banks[0], host_banks[0], rows[0],
+                               codebooks[0])
+    return quantized_grouped(kind, kernels.rotate(hidden, always, swiglu=True), groups, slot_banks[1], host_banks[1], rows[1],
+                             codebooks[1])
 
 
 def resident_prefill(x, topk_idx, topk_weight, banks, rows, kind, codebooks, num_experts):
@@ -270,7 +274,7 @@ class FP8HostBank(HostBank):
 
 
 class CpuSide:
-    """Where a decode step's layers hand experts to the CPU. A layer's graph copies its routing, its quantized input and
+    """Where a decode step's layers hand experts to the CPU. A layer's graph copies its routing, its rotated input and
     its step here and records posted[layer], then waits (`kernels.await_cpu`) for flag[layer] to reach that step; the
     host (`ExpertStore.after_layer`) runs the experts and writes result[layer], then the flag. One set per layer: the
     host serves a layer while the next one is already launched."""
@@ -307,7 +311,9 @@ class ExpertStore:
         # measured / modelled time of the CPU's and the GPU's share of a prompt's experts
         self.cpu_scale = self.gpu_scale = 1.0
         self.rotation = hadamard(256)
-        # set per generation with int8 experts on one GPU: decode hands missed experts to the CPU
+        # set per generation with int8 experts and a small cache: the CPU runs part of the missed experts, in a prompt's
+        # pass and, on one GPU, in decode steps through `cpu_side`
+        self.cpu_experts = False
         self.cpu_side = None
         # what a decode step's expert costs the CPU, as measured
         self.cpu_expert_us = CPU_EXPERT_US + CPU_ROW_US
@@ -322,32 +328,48 @@ class ExpertStore:
         return OffloadedExperts(self, len(self.banks) - 1)
 
     @contextlib.contextmanager
-    def session(self, device, patchers, cpu_decode):
+    def session(self, device, patchers, cpu_decode, rows, cpu_experts=True):
         """One generation's expert cache, sized to the VRAM free at its start less what the patchers' weights on
-        this device still need: a dynamic model's weights arrive on first use, and must not find the cache there.
-        A session opened inside another shares its cache, so the takes of one script keep what earlier ones loaded.
-        `cpu_decode`: every decode step calls `after_layer` after each layer (the model runs on this device alone)."""
+        this device still need (a dynamic model's weights arrive on first use, and must not find the cache there) and
+        what its longest take needs for `rows` rows of prompt and frames. A session opened inside another shares its
+        cache, so the takes of one script keep what earlier ones loaded.
+        `cpu_decode`: every decode step calls `after_layer` after each layer (the model runs on this device alone).
+        `cpu_experts`: the CPU may run part of the missed int8 experts."""
         if self.cache is not None:
             yield
             return
-        pending = sum(p.model_size() - p.loaded_size() for p in patchers if p.load_device == device)
+        loaded = [p.loaded_size() for p in patchers]
+        pending = sum(p.model_size() - size for p, size in zip(patchers, loaded) if p.load_device == device)
+        reserve = RESERVE_BASE + int(RESERVE_PER_ROW * rows)
         # other models (the codec, speech recognition) leave the VRAM to the cache; they load again when next used
         wanted = self.cache_bytes or sum(t.nbytes for banks in self.banks for bank in banks for t in bank.fields.values())
-        comfy.model_management.free_memory(wanted + pending + CACHE_RESERVE, device,
+        comfy.model_management.free_memory(wanted + pending + reserve, device,
                                            [m for m in comfy.model_management.current_loaded_models if m.model in patchers])
-        budget = max(0, comfy.model_management.get_free_memory(device) - pending - CACHE_RESERVE)
+        budget = max(0, comfy.model_management.get_free_memory(device) - pending - reserve)
         if self.cache_bytes:
             budget = min(budget, self.cache_bytes)
         self.cache = SlotPool(self.banks, budget, device)
+        if sum(p.loaded_size() for p in patchers) < sum(loaded):
+            # ComfyUI's dynamic VRAM counted less free VRAM than there is (its last reading was taken before the codec
+            # was unloaded and torch's pool trimmed), made room for the cache by evicting weights of this model, and
+            # keeps them out until the model is loaded again. Without this a whole generation streams them from RAM,
+            # at 250 ms a frame
+            time.sleep(EVICTION_PAUSE)
+            comfy.model_management.load_models_gpu(patchers)
         self.sync_free = (self.banks[0][0].kernel is not None and not comfy.model_management.DISABLE_PINNED_MEMORY
                           and kernels.available(device))
-        # int8 decode steps run most missed experts on the CPU, beside the GPU: per step on the 3090, 23 vs 25 ms with a
-        # 16 GB cache, 29 vs 42 with 8 GB, 35 vs 58 with 4 GB; on the 4090 20 vs 22 with 16 GB
         if self.sync_free and self.banks[0][0].kernel == "w4":
             # before any decode step is recorded as a graph, which cannot copy them in
             for bank in itertools.chain.from_iterable(self.banks):
                 bank.codebook(device)
-        if cpu_decode and self.sync_free and self.banks[0][0].kernel == "int8":
+        # The CPU runs most missed int8 experts, beside the GPU, while the cache holds under half of the experts: per
+        # decode step on the 3090, 29 vs 42 ms with an 8 GB cache, 35 vs 58 with 4 GB; on the 4090 34 vs 53 with 4 GB. With
+        # a larger cache the GPU reading its misses over PCIe is as fast, since those reads also fill the cache (4090,
+        # 17 GB: 17.8 against 19.4 with the CPU side), and a seed's take repeats exactly: the CPU's arithmetic differs
+        # from the kernels' in the last bits
+        self.cpu_experts = (cpu_experts and self.sync_free and self.banks[0][0].kernel == "int8"
+                            and 2 * self.cache.count < len(self.banks) * self.banks[0][0].num_experts)
+        if cpu_decode and self.cpu_experts:
             self.cpu_side = CpuSide(len(self.banks), MAX_EXPERTS_PER_ROW, self.banks[0][0].in_features)
         try:
             yield
@@ -355,6 +377,7 @@ class ExpertStore:
             self.cache.report()
             self.cache = None
             self.sync_free = False
+            self.cpu_experts = False
             self.cpu_side = None
             comfy.model_management.soft_empty_cache()
 
@@ -382,29 +405,29 @@ class ExpertStore:
         plan = kernels.resolve(ids, layer, len(self.banks), gate_up.num_experts, HALF_LIFE, side is not None, ADMIT,
                                *cache.device_state())
         slots_gate_up, slots_down = cache.fields
-        weights = weights[:, None].float()
+        weights = weights.float()
         if gate_up.kernel == "fp8":
             gate, up = kernels.gemv_fp8(x.float(), ids, plan, slots_gate_up, gate_up.fields, gate_up.rows("weight")).chunk(2, dim=-1)
             out = kernels.gemv_fp8(nn.functional.silu(gate) * up, ids, plan, slots_down, down.fields, down.rows("weight"))
-            return (out * weights).sum(0, keepdim=True).to(x.dtype)
+            return kernels.weighted_sum(out, weights)
         kind = gate_up.kernel
 
-        def experts(xq, xscale, late):
-            hidden = quantized_gemv(kind, xq, xscale, ids, plan, cache.took_over, late, slots_gate_up, gate_up.fields,
+        def experts(late):
+            """[k, H]: each expert's output, unweighted."""
+            hidden = quantized_gemv(kind, rotated, ids, plan, cache.took_over, late, slots_gate_up, gate_up.fields,
                                     gate_up.rows("_qdata"), gate_up.codebook(x.device))
-            hq, hscale = kernels.rotate_quantize(hidden, cache.took_over if late else cache.always, swiglu=True)
-            out = quantized_gemv(kind, hq, hscale, ids, plan, cache.took_over, late, slots_down, down.fields,
-                                 down.rows("_qdata"), down.codebook(x.device))
-            return (out * weights).sum(0, keepdim=True)
+            hidden = kernels.rotate(hidden, cache.took_over if late else cache.always, swiglu=True)
+            return quantized_gemv(kind, hidden, ids, plan, cache.took_over, late, slots_down, down.fields,
+                                  down.rows("_qdata"), down.codebook(x.device))
 
-        xq, xscale = kernels.rotate_quantize(x.float(), cache.always)
+        rotated = kernels.rotate(x, cache.always)
         if side is None:
-            return experts(xq, xscale, False).to(x.dtype)
-        # the CPU reads the same rotated, quantized row; its experts run there while the GPU runs the others
-        side.post(layer, plan, ids, weights[:, 0], (xq.float() * xscale[:, None]).to(torch.bfloat16), cache.step)
-        out = experts(xq, xscale, False) + side.wait(layer, plan, cache.step, cache.took_over)
+            return kernels.weighted_sum(experts(False), weights)
+        # the CPU reads the same rotated row; its experts run there while the GPU runs the others
+        side.post(layer, plan, ids, weights, rotated.to(torch.bfloat16), cache.step)
+        out = weights @ experts(False) + side.wait(layer, plan, cache.step, cache.took_over)
         # a late host: the GPU runs the CPU's experts itself
-        return (out + experts(xq, xscale, True)).to(x.dtype)
+        return (out + weights @ experts(True)).to(x.dtype)
 
     def after_layer(self, layer):
         """The host's part of decode layer `layer`, already launched: wait for its routing, run the experts it left to
@@ -456,7 +479,7 @@ class ExpertStore:
         slots.update((expert, cache.assign(slot, layer, expert)) for expert, slot in zip(fills, free))
         fills = set(fills)
         on_cpu = []
-        if gate_up.kernel == "int8":
+        if self.cpu_experts:
             on_cpu, cpu_us, gpu_us = self.split(rest[len(fills):], counts, cache.expert_bytes)
         cpu_set = set(on_cpu)
         groups = [(expert, slots.get(expert, -1), int(expert in fills), offsets[expert], counts[expert]) for expert in used if expert not in cpu_set]
@@ -559,6 +582,7 @@ class SlotPool:
         self.clock = torch.zeros((1,), dtype=torch.int32)
         self.reads = torch.zeros((3,), dtype=torch.int32)
         self.on_device = False
+        self.resident = None
         # (layer, expert, slot) reserved since the last promote; (event, [(key, slot)]) copies in flight
         self.reserved, self.copying = [], []
         self.reserve = RESERVE_START
@@ -573,8 +597,16 @@ class SlotPool:
         """(table, owner, score, at, pending, clock, budget, reads, step, share) on the GPU, where the decode kernels keep
         them."""
         if not self.on_device:
-            self.table, self.owner, self.score, self.at, self.pending, self.clock, self.reads = (t.to(self.device) for t in self._state())
-            self.budget = torch.tensor(self._budget(), dtype=torch.int32, device=self.device)
+            budget = torch.tensor(self._budget(), dtype=torch.int32)
+            if self.resident is None:
+                self.resident, self.budget = [t.to(self.device) for t in self._state()], budget.to(self.device)
+            else:
+                # at the addresses recorded decode steps read: a prompt's pass between them (a line taking over a
+                # row) brings the state to the host and back
+                for there, here in zip(self.resident, self._state()):
+                    there.copy_(here)
+                self.budget.copy_(budget)
+            self.table, self.owner, self.score, self.at, self.pending, self.clock, self.reads = self.resident
             self.on_device = True
         return self.table, self.owner, self.score, self.at, self.pending, self.clock, self.budget, self.reads, self.step, self.share
 
@@ -766,6 +798,18 @@ class FP8Experts(nn.Module):
         out = torch.empty_like(sorted_out)
         out[order] = sorted_out
         return out.view(num_tokens, top_k, -1).sum(dim=1)
+
+
+class HostEmbedding(nn.Module):
+    """The token embedding table left in host memory, beside the experts: a prompt or a frame reads a few rows of its
+    gigabyte, which the expert cache puts to better use."""
+
+    def __init__(self, embedding):
+        super().__init__()
+        self.table = embedding.weight.detach()
+
+    def forward(self, ids, out_dtype=None):
+        return self.table[ids.cpu()].to(ids.device, out_dtype)
 
 
 class OffloadedExperts(nn.Module):

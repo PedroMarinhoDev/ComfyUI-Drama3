@@ -1,7 +1,7 @@
 [project]
 name = "drama3"
 description = "Fish Audio Drama 3 text to speech, natively in ComfyUI: voice cloning, dialogue and inline cues on cards from 8 GB, plus a native Qwen3-ASR. Built with Fish Audio, not affiliated with it."
-version = "0.1.0"
+version = "0.2.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 classifiers = ["Operating System :: OS Independent", "Environment :: GPU :: NVIDIA CUDA"]

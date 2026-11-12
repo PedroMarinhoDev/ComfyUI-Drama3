@@ -8,7 +8,8 @@ Model file: the backbone and the codebook tower under this pack's key names. The
 as block-FP8 (128x128 scales); they are dequantized in fp32 and written as int8 ConvRot or W4A8 expert banks, the
 layouts `comfy.ops.MoEExperts` loads. The other linears stay the checkpoint's bf16 or become int8 ConvRot (`--dense`).
 Gate and up projections are fused (experts, shared expert, tower MLP). The LM head keeps only the rows generation
-samples from: end of speech, then the 4096 semantic tokens. Embeddings, heads, norms, the router and the small
+samples from: end of speech, then the 4096 semantic tokens; `line_head.weight` holds the rows of the newline and
+<|audio_separator|>, which a dialogue's take says between its lines. Embeddings, heads, norms, the router and the small
 DeltaNet gate projections stay bf16.
 
 Codec file: the Fish S2-Pro codec with weight norm folded and the unused saved attention masks dropped, fp32.
@@ -30,7 +31,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from drama3.config import AUDIO_HEAD_KEY  # noqa: E402
+from drama3.config import AUDIO_HEAD_KEY, LINE_HEAD_IDS, LINE_HEAD_KEY  # noqa: E402
 
 CONVROT_GROUP_SIZE = 256
 W4A8_GROUP_SIZE = 16
@@ -137,6 +138,7 @@ def convert_model(args):
             head = ckpt.get(name)
             out[AUDIO_HEAD_KEY] = torch.cat((head[config["eos_token_id"]:config["eos_token_id"] + 1],
                                              head[config["semantic_start_token_id"]:config["semantic_end_token_id"] + 1])).clone()
+            out[LINE_HEAD_KEY] = head[list(LINE_HEAD_IDS)].clone()
             continue
         if name.startswith("model.language_model."):
             key = "model." + name[len("model.language_model."):]

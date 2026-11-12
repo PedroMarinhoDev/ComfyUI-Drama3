@@ -17,13 +17,35 @@ import comfy.text_encoders.llama
 from comfy.ldm.flux.math import apply_rope1, rope
 from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.text_encoders.llama import RMSNorm, moe_experts_forward, rope_matrix
-from comfy.text_encoders.qwen35 import GatedAttention, GatedDeltaNet, LinearKV, Qwen35Transformer, Qwen35TransformerBlock
+from comfy.text_encoders.qwen35 import (GatedAttention, GatedDeltaNet, LinearKV, Qwen35Transformer, Qwen35TransformerBlock,
+                                        torch_chunk_gated_delta_rule)
 from . import kernels
 from .offload import FP8Experts, experts_decode, gather_experts, kernel_bank, resident_decode, resident_prefill
 
 # ComfyUI's Qwen3.5 decode changed after v0.41.2 (#17007): attention layers make their own KV caches and a DeltaNet
 # decode step commits the previous step's token. v0.41 and older decode through FixedKVBias.
 DEFERRED_DECODE = hasattr(LinearKV, "deferred_tracker")
+
+if DEFERRED_DECODE:
+    class RowKVCache(comfy.text_encoders.llama.FixedKVCache):
+        """The KV cache of lines decoded in one batch. Their prompts differ in length, so each row writes at its own
+        position (`position` [B]) and attends over its own length (`seqlen` [B]); the caches of a stack share both."""
+
+        @staticmethod
+        def shared(batch, device):
+            return (torch.zeros((batch,), device=device, dtype=torch.int64), torch.zeros((batch,), device=device, dtype=torch.int32),
+                    {"step": -1, "tree": None})
+
+        def prepare(self, num_tokens):
+            if self.tracker["step"] != self.index:
+                self.tracker["step"] = self.index
+                self.position.copy_(self.seqlen)
+                self.seqlen.add_(num_tokens)
+
+        def write(self, xk, xv):
+            index = self.position.view(-1, 1, 1, 1).expand(-1, xk.shape[1], 1, xk.shape[3])
+            self.key.scatter_(2, index, xk)
+            self.value.scatter_(2, index, xv)
 
 
 class SharedExpert(nn.Module):
@@ -33,7 +55,7 @@ class SharedExpert(nn.Module):
         self.down_proj = ops.Linear(intermediate, hidden, bias=False, device=device, dtype=dtype)
 
     def forward(self, x):
-        return self.down_proj(comfy.ops._swiglu_eager(self.gate_up_proj(x)))
+        return comfy.ops.linear_input_act(self.down_proj, self.gate_up_proj(x), "swiglu")
 
 
 class Experts(nn.Module):
@@ -86,13 +108,56 @@ class SparseMoeBlock(nn.Module):
         # after v0.41.2 the block hands its pre-norm to the MLP
         if norm is not None:
             x = norm(x)
+        if x.shape[0] > 1 and x.shape[1] == 1:
+            # the decode rows of lines batched together: each through the one-row kernels
+            return torch.cat([self(x[row:row + 1]) for row in range(x.shape[0])])
         flat = x.reshape(-1, x.shape[-1])
-        probabilities = torch.softmax(self.gate(flat).float(), dim=-1)
-        topk_weight, topk_idx = probabilities.topk(self.top_k, dim=-1)
-        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
-        out = self.experts(flat, topk_idx, topk_weight.to(flat.dtype))
+        logits = self.gate(flat)
+        if flat.shape[0] == 1 and kernels.available(flat.device):
+            # a decode row: one kernel in place of the softmax, the top-k and the renormalization
+            topk_idx, topk_weight = kernels.route(logits, self.top_k)
+        else:
+            topk_weight, topk_idx = torch.softmax(logits.float(), dim=-1).topk(self.top_k, dim=-1)
+            topk_weight = (topk_weight / topk_weight.sum(dim=-1, keepdim=True)).to(flat.dtype)
+        out = self.experts(flat, topk_idx, topk_weight)
         out = out + torch.sigmoid(self.shared_expert_gate(flat)) * self.shared_expert(flat)
         return out.view_as(x)
+
+
+class DeltaNet(GatedDeltaNet):
+    """ComfyUI's GatedDeltaNet starts from an empty state on any call of more than a few rows. This one also continues
+    from the state its cache holds, so a prompt's rows can run in two calls: the rows lines share once, kept, then
+    each line's own (`decode_lines`). The second call needs more rows than a decode step takes."""
+
+    def forward(self, x, past_key_value=None, **kwargs):
+        # v0.41 and older never get here with rows to continue: only lines decoded together run a prompt in two calls
+        if not DEFERRED_DECODE or past_key_value is None or past_key_value.index == 0 or past_key_value.decode_step(x.shape[1]):
+            return super().forward(x, past_key_value=past_key_value, **kwargs)
+        batch, rows, _ = x.shape
+        qkvz = self.combined_qkvz.forward(x)
+        if qkvz is NotImplemented:
+            proj, z = self.in_proj_qkv(x), self.in_proj_z(x)
+        else:
+            proj, z = qkvz.split((self.key_dim * 2 + self.value_dim, self.value_dim), dim=-1)
+        beta, a = self.in_proj_b(x).sigmoid(), self.in_proj_a(x)
+        # the conv reads the columns before these rows from the cache
+        state = past_key_value.conv_state
+        mixed = torch.cat((state, proj.transpose(1, 2)), dim=-1)
+        state.copy_(mixed[:, :, -state.shape[-1]:])
+        mixed = nn.functional.silu(self.conv1d(mixed)[:, :, state.shape[-1]:state.shape[-1] + rows]).transpose(1, 2)
+        query, key, value = mixed.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        g = past_key_value.g_decay * nn.functional.softplus(a.float() + past_key_value.dt_bias)
+        query = query.reshape(batch, rows, self.num_key_heads, self.key_head_dim)
+        key = key.reshape(batch, rows, self.num_key_heads, self.key_head_dim)
+        value = value.reshape(batch, rows, self.num_value_heads, self.value_head_dim)
+        if self.num_value_heads != self.num_key_heads:
+            repeats = self.num_value_heads // self.num_key_heads
+            query, key = query.repeat_interleave(repeats, dim=2), key.repeat_interleave(repeats, dim=2)
+        out, last = torch_chunk_gated_delta_rule(query, key, value, g=g, beta=beta, initial_state=past_key_value.recurrent_state,
+                                                 output_final_state=True)
+        past_key_value.recurrent_state.copy_(last.to(past_key_value.recurrent_state.dtype))
+        out = self.norm(out.reshape(-1, self.value_head_dim), z.reshape(-1, self.value_head_dim))
+        return self.out_proj(out.reshape(batch, rows, -1)), past_key_value
 
 
 class Drama3Block(Qwen35TransformerBlock):
@@ -101,7 +166,7 @@ class Drama3Block(Qwen35TransformerBlock):
         text = config.text
         self.layer_type = text.layer_types[index]
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(text, device=device, dtype=dtype, ops=ops)
+            self.linear_attn = DeltaNet(text, device=device, dtype=dtype, ops=ops)
         else:
             self.self_attn = GatedAttention(text, device=device, dtype=dtype, ops=ops)
         self.mlp = SparseMoeBlock(config, device=device, dtype=dtype, ops=ops)
@@ -144,14 +209,80 @@ class Drama3Backbone(Qwen35Transformer):
                 caches.append(comfy.text_encoders.llama.FixedKVBias.zeros(1, text.num_key_value_heads, capacity, text.head_dim, device, dtype, shared[device]))
         return caches
 
-    def run_layers(self, x, caches, layers, devices, decode_buffers=None, after_layer=None, ahead=False):
+    def init_batch_caches(self, batch, capacity, layers, device, dtype):
+        """(caches, side) for `batch` lines decoded together on one device: the decode state of all rows, and what
+        loading a line into a row needs (`row_caches`): a tracker and one-row side buffers for the DeltaNet layers."""
+        text = self.config
+        conv_dim = 2 * text.linear_num_key_heads * text.linear_key_head_dim + text.linear_num_value_heads * text.linear_value_head_dim
+        shared, tracker = RowKVCache.shared(batch, device), LinearKV.deferred_tracker(device)
+        caches, buffers = [], []
+        for layer in layers:
+            if layer.layer_type == "linear_attention":
+                cache = LinearKV(torch.zeros((batch, conv_dim, text.conv_kernel_size - 1), device=device, dtype=dtype),
+                                 torch.zeros((batch, text.linear_num_value_heads, text.linear_key_head_dim, text.linear_value_head_dim),
+                                             device=device, dtype=torch.float32), 0, None, None)
+                cache.qkv_buf, cache.proj_buf, cache.gates_buf, cache.sumsq_buf = comfy_kitchen.gated_delta_deferred_buffers(
+                    batch, conv_dim, text.linear_num_value_heads, text.linear_num_key_heads, dtype, device)
+                cache.ctl, cache.ctl_tracker = tracker["ctl"], tracker
+                buffers.append(comfy_kitchen.gated_delta_deferred_buffers(1, conv_dim, text.linear_num_value_heads, text.linear_num_key_heads,
+                                                                         dtype, device))
+            else:
+                cache = RowKVCache.zeros(batch, text.num_key_value_heads, capacity, text.head_dim, device, dtype, shared)
+            caches.append(cache)
+        return caches, (LinearKV.deferred_tracker(device), buffers)
+
+    @staticmethod
+    def row_caches(caches, index, side):
+        """One-row caches over row `index` of the batch's storage, for a line's prompt pass and the decode step of its
+        last prompt row; `adopt_row` then hands the row to the batch."""
+        tracker, buffers = side
+        tracker["step"] = None
+        kv, buffers = comfy.text_encoders.llama.FixedKVCache.shared(1, caches[0].key.device), iter(buffers)
+        row = []
+        for cache in caches:
+            if isinstance(cache, LinearKV):
+                row.append(LinearKV(cache.key[index:index + 1], cache.value[index:index + 1], 0, None, None,
+                                    cache.g_decay, cache.dt_bias, cache.norm_weight))
+                row[-1].qkv_buf, row[-1].proj_buf, row[-1].gates_buf, row[-1].sumsq_buf = next(buffers)
+                row[-1].ctl, row[-1].ctl_tracker = tracker["ctl"], tracker
+            else:
+                row.append(comfy.text_encoders.llama.FixedKVCache(cache.key[index:index + 1], cache.value[index:index + 1], 0, *kv))
+        return row
+
+    @staticmethod
+    def adopt_row(caches, row, index):
+        """The batch takes row `index` as its one-row caches left it: its length and, in the DeltaNet layers, the token
+        of its last step as the one the batch's next step commits (a decode step leaves its token to the next one, and
+        the batch commits one token for every row). Returns the row's length."""
+        for cache, one in zip(caches, row):
+            cache.index = max(cache.index, 1)
+            if isinstance(cache, LinearKV):
+                if cache.g_decay is None:
+                    # the layer's constants, which a prompt's pass makes anew: recorded steps read the first ones
+                    cache.g_decay, cache.dt_bias, cache.norm_weight = one.g_decay, one.dt_bias, one.norm_weight
+                side, own = cache.ctl_tracker["parity"], one.ctl_tracker["parity"]
+                for target, source in ((cache.qkv_buf, one.qkv_buf), (cache.proj_buf, one.proj_buf), (cache.gates_buf, one.gates_buf),
+                                       (cache.sumsq_buf, one.sumsq_buf)):
+                    target[side, index].copy_(source[own, 0])
+                cache.uncommitted = 1
+            else:
+                cache.seqlen[index] = one.index
+        return row[0].index
+
+    @staticmethod
+    def empty_row(caches, index):
+        """Row `index` holds no line: its attention caches start over, so the tokens it still writes stay in bounds."""
+        next(cache for cache in caches if not isinstance(cache, LinearKV)).seqlen[index] = 0
+
+    def run_layers(self, x, caches, layers, devices, decode_buffers=None, after_layer=None, ahead=False, positions=None):
         """Hidden states [1, T, H] after `layers` (the whole stack, in order) for the rows `x` [1, T, H] continue,
         each layer on its device; the result is on the last one. Not final-normed.
 
         A whole prompt runs in one call: the DeltaNet layers restart their state on any call of more than six rows.
         With `decode_buffers` (`init_decode_buffers`, one device) a decode row runs each layer as a CUDA graph, through
         the buffers, whose hidden state is the result. `after_layer(index)` runs on the host after each layer is
-        launched, or with `ahead` after the next one is (the layer waits for it on the GPU).
+        launched, or with `ahead` after the next one is (the layer waits for it on the GPU). `positions` [B, 1]: the
+        position of each row of a batch of decode rows (lines decoded together, one device, with `decode_buffers`).
         """
         past_len = caches[0].index
         start = 0
@@ -162,17 +293,20 @@ class Drama3Backbone(Qwen35Transformer):
                 end += 1
             with comfy.model_management.cuda_device_context(device):
                 x = self._segment(x.to(device), layers[start:end], caches[start:end], device, past_len, decode_buffers,
-                                  after_layer and (lambda index, start=start: after_layer(start + index)), ahead)
+                                  after_layer and (lambda index, start=start: after_layer(start + index)), ahead, positions)
             start = end
         return x
 
-    def _segment(self, x, layers, caches, device, past_len, decode_buffers, after_layer, ahead):
+    def _segment(self, x, layers, caches, device, past_len, decode_buffers, after_layer, ahead, positions):
         seq_len = x.shape[1]
-        positions = torch.arange(past_len, past_len + seq_len, device=device).unsqueeze(0)
         mask = None
         if seq_len > 1:
             mask = torch.full((seq_len, past_len + seq_len), torch.finfo(x.dtype).min / 4, device=device, dtype=x.dtype).triu_(past_len + 1)
-        freqs = self.compute_freqs_cis(positions, device)
+        if positions is None:
+            freqs = self.compute_freqs_cis(torch.arange(past_len, past_len + seq_len, device=device).unsqueeze(0), device)
+        else:
+            # one row at a time: compute_freqs_cis reads a leading dimension above one as image axes
+            freqs = torch.cat([rope_matrix(self.compute_freqs_cis(row[None], device)) for row in positions])
         if decode_buffers is not None:
             # the layers write their output into x in place, so graph replays land in the buffer
             hidden_buffer, rotary_buffer = decode_buffers
@@ -225,9 +359,9 @@ class TowerAttention(nn.Module):
         cfg = self.cfg
         length = x.shape[1]
         q, gate, k, v = self.wqkv(x).split(self.split, dim=-1)
-        q = self.rotate(self.q_norm(q.view(1, length, cfg.n_head, cfg.head_dim)).transpose(1, 2), freqs)
-        k = self.rotate(self.k_norm(k.view(1, length, cfg.n_local_heads, cfg.head_dim)).transpose(1, 2), freqs)
-        v = v.view(1, length, cfg.n_local_heads, cfg.head_dim).transpose(1, 2)
+        q = self.rotate(self.q_norm(q.view(-1, length, cfg.n_head, cfg.head_dim)).transpose(1, 2), freqs)
+        k = self.rotate(self.k_norm(k.view(-1, length, cfg.n_local_heads, cfg.head_dim)).transpose(1, 2), freqs)
+        v = v.view(-1, length, cfg.n_local_heads, cfg.head_dim).transpose(1, 2)
         if mask is None and DEFERRED_DECODE:
             cache.write(k, v)
             out = cache.attend(q, k, v)
@@ -246,7 +380,7 @@ class TowerMLP(nn.Module):
         self.w2 = ops.Linear(cfg.intermediate_size, cfg.dim, bias=False, device=device, dtype=dtype)
 
     def forward(self, x):
-        return self.w2(comfy.ops._swiglu_eager(self.w13(x)))
+        return comfy.ops.linear_input_act(self.w2, self.w13(x), "swiglu")
 
 
 class TowerLayer(nn.Module):
@@ -314,9 +448,32 @@ class Drama3Tower(nn.Module):
         return [cache.zeros(1, cfg.n_local_heads, capacity, cfg.head_dim, device, dtype, shared)
                 for _ in range(len(self.shared_layers) + len(self.residual_layers))]
 
+    def init_batch_caches(self, batch, capacity, device, dtype):
+        """The decode state of `batch` lines decoded together, as Drama3Backbone.init_batch_caches."""
+        cfg = self.cfg
+        shared = RowKVCache.shared(batch, device)
+        return [RowKVCache.zeros(batch, cfg.n_local_heads, capacity, cfg.head_dim, device, dtype, shared)
+                for _ in range(len(self.shared_layers) + len(self.residual_layers))]
+
+    @staticmethod
+    def row_caches(caches, index):
+        kv = comfy.text_encoders.llama.FixedKVCache.shared(1, caches[0].key.device)
+        return [comfy.text_encoders.llama.FixedKVCache(cache.key[index:index + 1], cache.value[index:index + 1], 0, *kv) for cache in caches]
+
+    @staticmethod
+    def adopt_row(caches, row, index):
+        for cache in caches:
+            cache.index = max(cache.index, 1)
+        caches[0].seqlen[index] = row[0].index
+
+    @staticmethod
+    def empty_row(caches, index):
+        caches[0].seqlen[index] = 0
+
     def context(self, positions, mask_rows, device, dtype):
-        """(freqs, mask, attention) for rows at `positions` [T]; decode rows (mask_rows == 0) attend without a mask."""
-        freqs = rope(positions.unsqueeze(0), self.cfg.rotary_dim, self.cfg.rope_base).unsqueeze(1)
+        """(freqs, mask, attention) for rows at `positions` [T], or [B, 1] for a batch of decode rows; decode rows
+        (mask_rows == 0) attend without a mask."""
+        freqs = rope(positions if positions.dim() == 2 else positions.unsqueeze(0), self.cfg.rotary_dim, self.cfg.rope_base).unsqueeze(1)
         mask = None
         if mask_rows:
             past = int(positions[0])
@@ -345,23 +502,23 @@ class Drama3Tower(nn.Module):
         return out
 
     def step(self, main, hidden, frame, caches, sample):
-        """Codes of the frame whose main token is `main` [1], after the frame row `frame` [1, 1 + N]: the shared
-        layers, then one residual layer and head per code, each code sampled before the next layer runs. Returns the
-        frame row [1, 1 + N].
+        """Codes of the frames whose main tokens are `main` [B], after the frame rows `frame` [B, 1 + N] (one row per
+        line decoded): the shared layers, then one residual layer and head per code, each code sampled before the
+        next layer runs. Returns the frame rows [B, 1 + N]. `hidden` is [B, 1, H].
 
         The caller prepares the caches for one row before and advances them after, and the row's position is read
         from them on the GPU, so a CUDA graph can replay this."""
-        context = self.context(caches[0].position[:1], 0, hidden.device, hidden.dtype)
+        context = self.context(caches[0].position[:len(main), None], 0, hidden.device, hidden.dtype)
         c0 = (main - self.semantic_start).clamp(0, self.cfg.vocab_size - 1)
-        semantic = self.is_semantic(main)[None]
+        semantic = self.is_semantic(main)[:, None]
         unseen = self.embedding_sum(frame, 1 + self.cfg.backbone_codebooks, self.cfg.num_codebooks, hidden.dtype)
         unseen = torch.where(self.is_semantic(frame[:, 0])[:, None], unseen, 0.0)
         for index, layer in enumerate(self.shared_layers):
-            hidden = layer(hidden, c0[None], semantic, context, caches[index], unseen[None] if index == 0 else None)
+            hidden = layer(hidden, c0[:, None], semantic, context, caches[index], unseen[:, None] if index == 0 else None)
         codes = [c0]
         for index, (layer, head) in enumerate(zip(self.residual_layers, self.heads)):
-            hidden = layer(hidden, codes[-1][None], semantic, context, caches[len(self.shared_layers) + index])
-            codes.append(sample(head(hidden[0])))
+            hidden = layer(hidden, codes[-1][:, None], semantic, context, caches[len(self.shared_layers) + index])
+            codes.append(sample(head(hidden[:, 0])))
         return torch.stack((main, *codes), dim=-1)
 
 
@@ -378,10 +535,11 @@ class Drama3Model(nn.Module):
         self.tower = Drama3Tower(config, device=device, dtype=dtype, ops=operations)
         # run every frame, so made resident first; `SecondGPU` takes them along
         self.every_frame = [self.audio_head, self.tower]
+        # loaded last: an evicted embedding table is read row by row from its host copy
+        self.evictable = [self.model.embed_tokens]
 
     def get_dynamic_vram__units(self):
-        # an evicted embedding table is read row by row from its host copy
-        return [*self.every_frame, *self.model.layers], [self.model.embed_tokens]
+        return [*self.every_frame, *self.model.layers], self.evictable
 
 
 class SecondGPU(nn.Module):
