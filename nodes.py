@@ -27,7 +27,7 @@ from .drama3.audio import cut_at_pause, tidy_clip, trim_edges, trim_pauses
 from .drama3.chunking import CHUNK_BYTES, CHUNK_MAX_SPEAKERS, by_speaker, chunk_lines, split_text
 from .drama3.editor import DEFAULTS, analyze, parse_edits, plan, render
 from .drama3.codec import DECODE_CONTEXT, DECODE_FRAME_BYTES, DECODE_WINDOW, FRAME_LENGTH, SAMPLE_RATE
-from .drama3.generate import batchable, generate, generate_lines, session_rows
+from .drama3.generate import generate, generate_lines, session_rows, unbatched
 from .drama3.loader import load_codec, load_drama3
 from .drama3.prompt import LINE_SEPARATOR, MAX_SPEAKER, as_speaker_0, build_prompt, retag, speaker_of, with_speaker_tag
 from .qwen3_asr.asr import LANGUAGES, load_qwen3_asr, transcribe
@@ -87,6 +87,12 @@ class Drama3Loader(io.ComfyNode):
                                        "system RAM. In VRAM needs the whole file in VRAM (or split over two GPUs)."),
                 io.Float.Input("expert_cache_gb", default=0.0, min=0.0, max=256.0, step=0.5,
                                tooltip="VRAM for cached experts when they live in RAM; 0 uses what is free when generation starts."),
+                io.Boolean.Input("pin_experts", default=not comfy.model_management.is_integrated_gpu(),
+                                 tooltip="Keep the experts in pinned host memory: the pack's CUDA kernels read them during a decode "
+                                         "step, which is what lets the step replay as a CUDA graph, and what `voice_guidance` and "
+                                         "`lines_at_once` need. Off, a cache miss copies its expert to the VRAM instead, and those two "
+                                         "stay off. Costs the file's size in locked system RAM while the model is loaded; ComfyUI's "
+                                         "--disable-pinned-memory does not decide it, this input does."),
                 io.Combo.Input("second_gpu", options=gpu_choices(), default="none", advanced=True,
                                tooltip="Run the last backbone layers, the head and the tower on this GPU. The int8 file fits two "
                                        "24 GB cards with the experts in VRAM."),
@@ -97,12 +103,14 @@ class Drama3Loader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_name, experts="in RAM", expert_cache_gb=0.0, second_gpu="none", split_layer=0) -> io.NodeOutput:
+    def execute(cls, model_name, experts="in RAM", expert_cache_gb=0.0, pin_experts=True, second_gpu="none",
+                split_layer=0) -> io.NodeOutput:
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         second = None if second_gpu == "none" else torch.device(second_gpu)
         if second is not None and second == comfy.model_management.get_torch_device():
             raise ValueError(f"Drama 3: the second GPU must differ from ComfyUI's main device {second}")
-        return io.NodeOutput(load_drama3(path, second, split_layer, experts_in_ram=experts == "in RAM", expert_cache_gb=expert_cache_gb))
+        return io.NodeOutput(load_drama3(path, second, split_layer, experts_in_ram=experts == "in RAM",
+                                         expert_cache_gb=expert_cache_gb, pin_experts=pin_experts))
 
 
 class Drama3CodecLoader(io.ComfyNode):
@@ -295,7 +303,7 @@ class Drama3Generate(io.ComfyNode):
                                        "clearly their own (lead +0.02 to +0.08 hearing the line before, +0.01 to +0.05 together; "
                                        "none of 18 lines nearer the other voice, against 3 and 9); 2.0 gained little more and "
                                        "cost words in two takes. Cost: those takes render about twice as long, and a seed's "
-                                       "takes change. Needs one GPU and ComfyUI after v0.41.2."),
+                                       "takes change. Needs one GPU, pinned experts and ComfyUI after v0.41.2."),
             ],
             outputs=[Drama3Codes.Output()],
         )
@@ -383,8 +391,9 @@ class Drama3Generate(io.ComfyNode):
         width = 2 if guidance else min(batch, len(chunks))
         with model.session(session_rows(rows, width)):
             voiced = {speaker_of(transcript) for transcript, _ in references}
-            if guidance and not batchable(model):
-                logging.warning("Drama 3: voice_guidance needs one GPU and ComfyUI after v0.41.2; generating without it.")
+            reason = unbatched(model) if guidance else None
+            if reason is not None:
+                logging.warning("Drama 3: voice_guidance needs %s; generating without it.", reason)
                 guidance = 0.0
 
             def waits(index, beside):
@@ -406,7 +415,7 @@ class Drama3Generate(io.ComfyNode):
                     voices = {speaker_of(chunks[index]): heard_speaker(index)} if heard_speaker(index) in voiced else None
                 return voices and prompt_for(index, len(taken), voices)
 
-            if batch > 1 and batchable(model):
+            if batch > 1 and unbatched(model) is None:
                 # a row whose line has ended takes the next one: a line hears the takes finished before it starts
                 ahead, running = list(range(len(chunks))), set()
 
@@ -469,7 +478,7 @@ class Drama3SpeedOptions(io.ComfyNode):
                                      "ends hands its place to the next. Gain: a ten-minute story on an RTX 4090 with W4A8 "
                                      "takes 225 s at 1, 111 s at 4, 107 s at 8; with FP8 303 s, 199 s, 229 s. Cost: a "
                                      "line hears its speaker's takes that had finished when it started, not always the line "
-                                     "right before it, and a seed's takes change with this number. Needs one GPU and "
+                                     "right before it, and a seed's takes change with this number. Needs one GPU, pinned experts and "
                                      "ComfyUI after v0.41.2; otherwise the lines run one by one in groups of this many, "
                                      "hearing the takes before their group."),
                 io.Boolean.Input("repeatable_takes", default=False,
