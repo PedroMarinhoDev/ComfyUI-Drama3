@@ -87,24 +87,24 @@ class Drama3Loader(io.ComfyNode):
                                        "system RAM. In VRAM needs the whole file in VRAM (or split over two GPUs)."),
                 io.Float.Input("expert_cache_gb", default=0.0, min=0.0, max=256.0, step=0.5,
                                tooltip="VRAM for cached experts when they live in RAM; 0 uses what is free when generation starts."),
-                io.Boolean.Input("pin_experts", default=not comfy.model_management.is_integrated_gpu(),
-                                 tooltip="Keep the experts in pinned host memory: the pack's CUDA kernels read them during a decode "
-                                         "step, which is what lets the step replay as a CUDA graph, and what `voice_guidance` and "
-                                         "`lines_at_once` need. Off, a cache miss copies its expert to the VRAM instead, and those two "
-                                         "stay off. Costs the file's size in locked system RAM while the model is loaded; ComfyUI's "
-                                         "--disable-pinned-memory does not decide it, this input does."),
                 io.Combo.Input("second_gpu", options=gpu_choices(), default="none", advanced=True,
                                tooltip="Run the last backbone layers, the head and the tower on this GPU. The int8 file fits two "
                                        "24 GB cards with the experts in VRAM."),
                 io.Int.Input("split_layer", default=0, min=0, max=39, advanced=True,
                              tooltip="First layer on the second GPU; 0 balances the two cards' free memory."),
+                io.Boolean.Input("pin_experts", default=not comfy.model_management.is_integrated_gpu(), advanced=True,
+                                 tooltip="Keep the experts in pinned host memory: the pack's CUDA kernels read them during a decode "
+                                         "step, which is what lets the step replay as a CUDA graph, and what `voice_guidance` and "
+                                         "`lines_at_once` need. Off, a cache miss copies its expert to the VRAM instead, and those two "
+                                         "stay off. Costs the file's size in locked system RAM while the model is loaded; ComfyUI's "
+                                         "--disable-pinned-memory does not decide it, this input does."),
             ],
             outputs=[Drama3Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model_name, experts="in RAM", expert_cache_gb=0.0, pin_experts=True, second_gpu="none",
-                split_layer=0) -> io.NodeOutput:
+    def execute(cls, model_name, experts="in RAM", expert_cache_gb=0.0, second_gpu="none", split_layer=0,
+                pin_experts=True) -> io.NodeOutput:
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         second = None if second_gpu == "none" else torch.device(second_gpu)
         if second is not None and second == comfy.model_management.get_torch_device():

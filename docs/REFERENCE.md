@@ -19,7 +19,7 @@ is to Fish Audio's code.
 
 | Node | What it does |
 |---|---|
-| **Load Drama 3** | Loads a model file. `experts`: in RAM (default) or in VRAM; `expert_cache_gb`: VRAM for cached experts (0 = what is free); `pin_experts`: keep the experts in pinned system memory, on by default and off on an integrated GPU; advanced: a second GPU for the experts-in-VRAM split. |
+| **Load Drama 3** | Loads a model file. `experts`: in RAM (default) or in VRAM; `expert_cache_gb`: VRAM for cached experts (0 = what is free); advanced: a second GPU for the experts-in-VRAM split, and `pin_experts`: keep the experts in pinned system memory, on by default and off on an integrated GPU. |
 | **Load Drama 3 Codec** | Loads the codec from `models/vae`. |
 | **Load Reference Audio** | Load Audio for a voice to clone. `trim` (on) cuts the clip's silent edges and keeps at most `length` (5–30 s, 20 s by default), cut in its latest pause before that. Fish Audio recommends 10–30 s of reference audio. |
 | **Drama 3 Encode Voice** | A voice to clone: an audio clip and its exact transcript. |
