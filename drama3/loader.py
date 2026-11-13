@@ -103,7 +103,7 @@ def auto_split(model, first_device, second_device):
     return best[1]
 
 
-def load_drama3(path, second_device=None, split=0, experts_in_ram=False, expert_cache_gb=0.0):
+def load_drama3(path, second_device=None, split=0, experts_in_ram=False, expert_cache_gb=0.0, pin_experts=True):
     state, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
     if not metadata or "drama3_config" not in metadata:
         raise ValueError(f"{os.path.basename(path)} is not a converted Drama 3 file (tools/convert.py model)")
@@ -124,11 +124,17 @@ def load_drama3(path, second_device=None, split=0, experts_in_ram=False, expert_
         raise ValueError(f"Drama 3 checkpoint keys: unexpected {result.unexpected_keys[:6]}, missing {result.missing_keys[:6]}")
     experts = None
     if experts_in_ram:
-        experts = ExpertStore(int(expert_cache_gb * 1024 ** 3))
+        experts = ExpertStore(int(expert_cache_gb * 1024 ** 3), pin_experts)
         for layer in model.model.layers:
             layer.mlp.experts = experts.add(layer.mlp.experts)
         model.model.embed_tokens = HostEmbedding(model.model.embed_tokens)
         model.evictable = []
+        if pin_experts:
+            logging.info("Drama 3: %d GB of experts pinned in host memory.",
+                         sum(t.nbytes for banks in experts.banks for bank in banks for t in bank.fields.values()) // 1024 ** 3)
+        else:
+            logging.warning("Drama 3: experts unpinned, so the kernels cannot read them: decode copies each expert instead, and "
+                            "voice_guidance and lines_at_once stay off.")
     if second_device is None:
         return Drama3(model, patcher, line_head, experts=experts)
 

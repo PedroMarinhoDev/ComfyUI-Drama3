@@ -149,7 +149,18 @@ render time.
 <summary><b>Out of memory, or the first run takes minutes</b></summary>
 
 Lower `expert_cache_gb` on **Load Drama 3**, or pick a smaller file if system RAM is the limit. The first run reads
-the whole model file from disk once; later runs start in seconds.
+the whole model file from disk once; later runs start in seconds. Pinning is not a way out: pinned experts cost the
+same system RAM as unpinned ones, only locked.
+
+</details>
+
+<details>
+<summary><b>`voice_guidance` or `lines_at_once` does nothing</b></summary>
+
+Both decode a frame as one CUDA graph, which needs the experts pinned where the kernels can read them. ComfyUI's
+`--disable-pinned-memory` does not decide that; `pin_experts` on **Load Drama 3** does, and Generate names what is
+missing when it cannot batch. A cache holding under half the experts (int8 on a card under about 20 GB) leaves some
+of them to the CPU, which also stops the batching: raise `expert_cache_gb` or pick a smaller file.
 
 </details>
 

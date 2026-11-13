@@ -57,8 +57,8 @@ def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_fra
     A take without sound, or one that stalls within its first OPENING_FRAMES, is taken once more, drawing on from the
     same generator, as Fish Audio's Drama 3 Space retries a silent or incomplete opening.
 
-    With `contrast` (the prompt rows of the same text in another voice; needs `batchable`) the take is decoded beside
-    it, each step drawing from the logits pushed away from the contrast's: l + guidance * (l - l_contrast)."""
+    With `contrast` (the prompt rows of the same text in another voice, decoded in one batch with the take) the take is
+    decoded beside it, each step drawing from the logits pushed away from the contrast's: l + guidance * (l - l_contrast)."""
     config = drama3.config
     generator = torch.Generator(device=drama3.parts()[1][-1]).manual_seed(seed)
     for attempt in range(OPENING_ATTEMPTS):
@@ -81,13 +81,22 @@ def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_fra
     return frames
 
 
-def batchable(drama3):
-    """Whether several lines can be decoded in one batch, inside a session: one device, ComfyUI's decode after v0.41.2,
-    the layers replayed as CUDA graphs, and every expert read by the kernels on the GPU."""
+def unbatched(drama3):
+    """Why lines cannot be decoded in one batch, or None if they can: what to change, in words a warning can print."""
     layers, devices, _, _, _ = drama3.parts()
-    return (DEFERRED_DECODE and drama3.second is None and comfy.model_prefetch.malloc_graph_enabled(devices[0])
-            and all(layer.mlp.experts.sync_free(devices[0]) for layer in layers)
-            and (drama3.experts is None or drama3.experts.cpu_side is None))
+    if not DEFERRED_DECODE:
+        return "ComfyUI after v0.41.2"
+    if drama3.second is not None:
+        return "one GPU"
+    if not comfy.model_prefetch.malloc_graph_enabled(devices[0]):
+        return "DynamicVRAM on a CUDA card, and no --disable-comfy-compiler"
+    if not all(layer.mlp.experts.sync_free(devices[0]) for layer in layers):
+        if drama3.experts is not None and not drama3.experts.pin:
+            return "pin_experts on"
+        return "the CUDA kernels that read the experts in place, which this card and file cannot run"
+    if drama3.experts is not None and drama3.experts.cpu_side is not None:
+        return "an expert cache holding half the experts, so the CPU runs none of them"
+    return None
 
 
 def session_rows(capacity, width):
@@ -102,7 +111,7 @@ def generate_lines(drama3, width, capacity, most, next_line, keep, temperature, 
     that ends leaves its row to the next. `next_line()` gives (key, prompt rows, max frames) or None while no line may
     start; `keep(key, frames)` takes a finished line. A line without a complete opening is taken once more.
     `capacity`: the rows a line's caches hold (its prompt and frames), `most` the largest max frames. Needs
-    `batchable`."""
+    `unbatched` to return None."""
     config = drama3.config
     generator = torch.Generator(device=drama3.parts()[1][0]).manual_seed(seed)
     again, attempts = [], {}

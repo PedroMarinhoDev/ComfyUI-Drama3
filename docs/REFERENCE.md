@@ -19,7 +19,7 @@ is to Fish Audio's code.
 
 | Node | What it does |
 |---|---|
-| **Load Drama 3** | Loads a model file. `experts`: in RAM (default) or in VRAM; `expert_cache_gb`: VRAM for cached experts (0 = what is free); advanced: a second GPU for the experts-in-VRAM split. |
+| **Load Drama 3** | Loads a model file. `experts`: in RAM (default) or in VRAM; `expert_cache_gb`: VRAM for cached experts (0 = what is free); `pin_experts`: keep the experts in pinned system memory, on by default and off on an integrated GPU; advanced: a second GPU for the experts-in-VRAM split. |
 | **Load Drama 3 Codec** | Loads the codec from `models/vae`. |
 | **Load Reference Audio** | Load Audio for a voice to clone. `trim` (on) cuts the clip's silent edges and keeps at most `length` (5–30 s, 20 s by default), cut in its latest pause before that. Fish Audio recommends 10–30 s of reference audio. |
 | **Drama 3 Encode Voice** | A voice to clone: an audio clip and its exact transcript. |
@@ -172,8 +172,9 @@ the 0.6B.
 
 Drama 3 is a Qwen3.5-style mixture of experts: 40 layers, each with 256 routed experts of which 8 run per frame,
 plus attention or DeltaNet, a shared expert and a 13-layer codebook decoder. Everything except the routed experts is
-about 5 GB and stays on the GPU. With **experts in RAM** the experts stay in pinned system memory and the VRAM left
-free caches the most used ones (93% of FP8 or int8 reads hit a 17 GB cache, 99% of W4A8's, which fits whole).
+about 5 GB and stays on the GPU. With **experts in RAM** the experts stay in pinned system memory (`pin_experts` on
+**Load Drama 3**) and the VRAM left free caches the most used ones (93% of FP8 or int8 reads hit a 17 GB cache, 99%
+of W4A8's, which fits whole).
 
 The pack's CUDA kernels, compiled at run time by PyTorch (no compiler or package to install), look each expert up in
 the cache on the GPU, run the cached ones in place and read the missed ones straight from RAM, filling free cache
@@ -181,6 +182,12 @@ slots as they go. With int8 experts and a cache that holds under half of them (c
 computes part of the misses at the same time. Since nothing in a frame waits on the CPU, every layer and the codebook
 decoder replay as CUDA graphs. Where PyTorch can't compile the kernels the nodes copy the experts instead, at the
 first version's speed.
+
+Pinning is the pack's own decision: `pin_experts` on **Load Drama 3** makes it, not ComfyUI's `--disable-pinned-memory`,
+which speaks for ComfyUI's own weights. Pinned banks cost the same system RAM as unpinned ones, locked rather than
+pageable, and they are copied a layer at a time, so the peak is that layer's banks above the file's size. With
+`pin_experts` off every miss is copied to the VRAM instead, at the first version's speed, and `voice_guidance` and
+`lines_at_once` stay off: neither runs in a frame that waits on the host.
 
 With **experts in VRAM** the whole file sits on the GPU and the same kernels read the experts in place; two 24 GB
 cards can split the layers (`second_gpu`).

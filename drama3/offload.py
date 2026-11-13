@@ -51,8 +51,8 @@ ADMIT = 6.0
 AWAIT_US = 5000
 
 
-def pinned(tensor):
-    if comfy.model_management.DISABLE_PINNED_MEMORY:
+def pinned(tensor, pin):
+    if not pin:
         return tensor.contiguous()
     out = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     return out.copy_(tensor)
@@ -200,14 +200,14 @@ def experts_decode(x, gate_up, down, weights):
 
 
 class HostBank:
-    """One expert bank in pinned host memory: tensors whose first dimension holds each expert's rows in turn.
-    `kernel` names the decode kernel that reads it ("int8", "fp8"), or None."""
+    """One expert bank in host memory, pinned when the loader asked for it: tensors whose first dimension holds each
+    expert's rows in turn. `kernel` names the decode kernel that reads it ("int8", "fp8"), or None."""
 
     kernel = None
 
-    def __init__(self, num_experts, fields):
+    def __init__(self, num_experts, fields, pin):
         self.num_experts = num_experts
-        self.fields = {n: pinned(t) for n, t in fields.items()}
+        self.fields = {n: pinned(t, pin) for n, t in fields.items()}
 
     def rows(self, name):
         return self.fields[name].shape[0] // self.num_experts
@@ -223,12 +223,12 @@ class HostBank:
 class QuantHostBank(HostBank):
     """A flat `comfy.ops.MoEExperts` bank (int8 ConvRot, W4A8, W6A8); its experts run as QuantizedTensors."""
 
-    def __init__(self, module):
+    def __init__(self, module, pin):
         weight = module.weight
         if not isinstance(weight, QuantizedTensor) or weight._qdata.ndim != 2:
             raise ValueError("Drama 3 keeps only flat quantized or FP8 expert banks in host memory")
         fields = per_row_fields(weight)
-        super().__init__(module.num_experts, fields)
+        super().__init__(module.num_experts, fields, pin)
         self.shared = {n: v for n, v in tensor_fields(weight).items() if n not in fields}
         self.shared_on = {}
         self.layout, self.params, self.in_features = weight._layout_cls, weight._params, weight._params.orig_shape[-1]
@@ -266,8 +266,8 @@ class FP8HostBank(HostBank):
 
     kernel = "fp8"
 
-    def __init__(self, weight, scale):
-        super().__init__(weight.shape[0], {"weight": weight.view(torch.uint8).flatten(0, 1), "scale": scale.flatten(0, 1)})
+    def __init__(self, weight, scale, pin):
+        super().__init__(weight.shape[0], {"weight": weight.view(torch.uint8).flatten(0, 1), "scale": scale.flatten(0, 1)}, pin)
 
     def weight(self, fields, device):
         return dequantize_fp8(fields["weight"].view(torch.float8_e4m3fn), fields["scale"], torch.bfloat16)
@@ -300,11 +300,13 @@ class CpuSide:
 
 
 class ExpertStore:
-    def __init__(self, cache_bytes=0):
-        """`cache_bytes` 0 sizes the expert cache to the VRAM free when a generation starts."""
+    def __init__(self, cache_bytes, pin):
+        """`cache_bytes` 0 sizes the expert cache to the VRAM free when a generation starts. `pin` keeps the banks in
+        pinned host memory, which is what lets the kernels read them from a decode step."""
         self.banks = []
         self.cache = None
         self.cache_bytes = cache_bytes
+        self.pin = pin
         # set per generation: decode runs the kernels, never waiting on the host
         self.sync_free = False
         self.cpu = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="drama3-experts")
@@ -321,9 +323,10 @@ class ExpertStore:
     def add(self, experts):
         """Take a layer's experts into host memory; returns the module that replaces them in the model."""
         if isinstance(experts, FP8Experts):
-            banks = (FP8HostBank(experts.gate_up_weight, experts.gate_up_scale), FP8HostBank(experts.down_weight, experts.down_scale))
+            banks = (FP8HostBank(experts.gate_up_weight, experts.gate_up_scale, self.pin),
+                     FP8HostBank(experts.down_weight, experts.down_scale, self.pin))
         else:
-            banks = (QuantHostBank(experts.gate_up_proj), QuantHostBank(experts.down_proj))
+            banks = (QuantHostBank(experts.gate_up_proj, self.pin), QuantHostBank(experts.down_proj, self.pin))
         self.banks.append(banks)
         return OffloadedExperts(self, len(self.banks) - 1)
 
@@ -356,8 +359,7 @@ class ExpertStore:
             # at 250 ms a frame
             time.sleep(EVICTION_PAUSE)
             comfy.model_management.load_models_gpu(patchers)
-        self.sync_free = (self.banks[0][0].kernel is not None and not comfy.model_management.DISABLE_PINNED_MEMORY
-                          and kernels.available(device))
+        self.sync_free = (self.banks[0][0].kernel is not None and self.pin and kernels.available(device))
         if self.sync_free and self.banks[0][0].kernel == "w4":
             # before any decode step is recorded as a graph, which cannot copy them in
             for bank in itertools.chain.from_iterable(self.banks):
